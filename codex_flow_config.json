@@ -1,0 +1,24 @@
+{
+  "_comment": "Codex Flow 统一配置文件 — 所有设置集中于此, 不使用环境变量",
+
+  "codex_home": "",
+  "openai_api_key": "",
+  "codex_api_key": "",
+
+  "model": "gpt-5.5",
+
+  "feishu": {
+    "_comment": "飞书应用凭据 — 从飞书开放平台获取: https://open.feishu.cn",
+    "app_id": "cli_aa94ca5f7efa5cef",
+    "app_secret": "",
+    "chat_id": ""
+  },
+
+  "loop": {
+    "max_iter": 10,
+    "target_wape": null,
+    "max_sleep_hours": 24.0,
+    "human_review": false,
+    "review_timeout": 1800
+  }
+}

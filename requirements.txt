@@ -1,0 +1,7 @@
+numpy==2.4.6
+openai-codex==0.1.0b3
+openai-codex-cli-bin==0.137.0a4
+pandas==3.0.3
+pydantic==2.13.4
+pydantic_core==2.46.4
+PyYAML==6.0.3
