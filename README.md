@@ -1,4 +1,4 @@
-# ComboScope Codex Flow
+# ForeCast by Codex Flow
 
 基于 OpenAI Codex SDK 的预测实验自动诊断与优化工作流。
 
