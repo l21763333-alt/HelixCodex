@@ -444,6 +444,28 @@ THREAD_REPORT = ThreadSpec(
 """,
 )
 
+# ── T5: Feishu Review Card ──
+# forecast-feishu-review-card 的 SKILL.md 已定义卡片格式/体积限制/质量检查
+THREAD_FEISHU_CARD = ThreadSpec(
+    phase="feishu-card",
+    skills=[
+        ("forecast-feishu-review-card", "forecast-feishu-review-card"),
+    ],
+    sandbox=Sandbox.read_only,
+    prompt="""\
+将实验报告精炼为飞书人工审批卡片。使用 forecast-feishu-review-card skill。
+
+输入 (位于 {output_dir}/):
+  final_report.md               — T4 完整报告
+  evaluation/metric_comparison.json — 指标对比
+  agent1/experiment_plan.yaml  — 实验计划 (改动列表)
+  agent2/review_result.json    — 确定性决策 (不可修改)
+
+必须产出:
+  {output_dir}/feishu_review_card.md — 飞书卡片文本 (≤40行)
+""",
+)
+
 
 # ============================================================
 # 产物清单管理 (轻量级, 替代 AgentRunRecorder + trace_writer + trial_archive)
@@ -1185,6 +1207,25 @@ def run_workflow(
             manifest.record_error("report", str(e))
             raise
 
+        # ── T5: Feishu Review Card ──
+        try:
+            t5_id = run_codex_thread(cx, THREAD_FEISHU_CARD, **thread_kwargs)
+            manifest.record("feishu_card", t5_id, [
+                "feishu_review_card.md",
+            ])
+            # 输出卡片内容到控制台
+            card_path = Path(output_dir) / "feishu_review_card.md"
+            if card_path.exists():
+                card_text = card_path.read_text(encoding="utf-8")
+                print(f"\n{'='*50}")
+                print(f"[T5] 飞书审批卡片:")
+                print(card_text)
+                print(f"{'='*50}")
+            cx.thread_archive(t5_id)
+        except Exception as e:
+            manifest.record_error("feishu_card", str(e))
+            print(f"[T5] 卡片生成失败(非致命): {e}")
+
         return comparison
 
     # ── 认证 + 执行 ──
@@ -1312,6 +1353,8 @@ def run_loop(
 
                 # ── 飞书通知: 本轮结果 ──
                 lark.notify_trial_done(trial_output, comparison, credits)
+                # ── 飞书审批卡片 (精炼版, 含 /keep /rollback 等指令) ──
+                lark.send_review_card(trial_output)
 
                 # 停止条件1: 达到目标 WAPE
                 if target_wape is not None and current_wape <= target_wape:
