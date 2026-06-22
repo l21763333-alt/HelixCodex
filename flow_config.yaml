@@ -25,9 +25,9 @@ auth:
 # ── 飞书集成 ───────────────────────────────────────────────
 feishu:
   enabled: true            # 是否启用飞书通知
-  app_id: "cli_aab265dad8bf9cb3"
+  app_id: ""
   app_secret: ""                                            # 设置环境变量 FEISHU_APP_SECRET
-  chat_id: "oc_f68aa0f27b4e5aa077b962a510f8ae4f"  # 目标群聊 ID (oc_xxx)
+  chat_id: ""  # 目标群聊 ID (oc_xxx)
   verification_token: ""                                   # 设置环境变量 FEISHU_VERIFICATION_TOKEN
 
   # 消息接收 (轮询模式, 零外部依赖)
