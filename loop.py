@@ -39,6 +39,16 @@ from lark_notify import (
 )
 from checkpoint_manager import LoopCheckpointManager
 
+try:
+    from mcp_servers.lark_research_server.server import feishu_review_via_mcp
+except Exception:  # pragma: no cover - optional adapter fallback
+    feishu_review_via_mcp = None
+
+try:
+    from mcp_servers.git_research_server import server as baseline_git_mcp
+except Exception:  # pragma: no cover - optional adapter fallback
+    baseline_git_mcp = None
+
 
 # ═══════════════════════════════════════════════════════════
 # 主循环类
@@ -78,6 +88,7 @@ class AIExperimentLoop:
         self.original_ask = ask
         self.output_base = Path(output_base)
         self.output_base.mkdir(parents=True, exist_ok=True)
+        self.run_label = self._make_run_label(self.output_base)
 
         # ── 循环控制 ──
         self.max_iter = max_iter if max_iter is not None else loop_cfg.max_iter
@@ -94,12 +105,36 @@ class AIExperimentLoop:
 
         # ── 运行时状态 ──
         self.round_num: int = 0
-        self.trial_counter: int = 0
+        self.trial_counter: int = self._detect_existing_trial_counter()
+        self.source_experiment_dir: str = str(self.experiment_dir)
+        self.current_previous_trial: str | None = None
         self.current_baseline_dir: str = str(self.experiment_dir)
         self.current_ask: str = self.original_ask
         self.human_supplements: list[str] = []
         self.should_stop: bool = False
         self.manifests: list[Any] = []
+        self._trial_model_snapshots: dict[str, str] = {}
+
+    @staticmethod
+    def _make_run_label(output_base: Path) -> str:
+        label = output_base.name or "run"
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in label)
+        return safe or "run"
+
+    def _git_trial_id(self, trial_id: str) -> str:
+        return f"{self.run_label}_{trial_id}"
+
+    def _rollback_key(self) -> str:
+        return f"round_{self.round_num:03d}"
+
+    def _detect_existing_trial_counter(self) -> int:
+        max_seen = 0
+        for path in self.output_base.glob("trial_[0-9][0-9][0-9]"):
+            try:
+                max_seen = max(max_seen, int(path.name.rsplit("_", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        return max_seen
 
     # ── 主循环 ──────────────────────────────────────────
 
@@ -124,12 +159,12 @@ class AIExperimentLoop:
                 if self._check_convergence():
                     break
 
-                # ── 轮次递增 ──
-                self.round_num += 1
-
-                if self.round_num > self.max_iter:
+                if self.round_num >= self.max_iter:
                     self._stop(f"达到最大轮次 {self.max_iter}")
                     break
+
+                # ── 轮次递增 ──
+                self.round_num += 1
 
                 # ── 执行一轮 ──
                 result = self._execute_one_round()
@@ -188,17 +223,34 @@ class AIExperimentLoop:
 
         print(f"\n{'='*60}")
         print(f"[Loop] Round {self.round_num} → {trial_id}")
-        print(f"[Loop] Baseline: {self.current_baseline_dir}")
+        print(f"[Loop] Experiment: {self.source_experiment_dir}")
+        print(f"[Loop] Previous trial: {self.current_previous_trial or '(none)'}")
         print(f"[Loop] Ask: {self.current_ask[:200]}...")
         print(f"{'='*60}")
+
+        model_snapshot_path: str | None = None
+        git_trial_id = self._git_trial_id(trial_id)
+        if self._git_mcp_enabled():
+            try:
+                branch_info = baseline_git_mcp.create_model_trial_branch(git_trial_id)
+                snapshot = baseline_git_mcp.snapshot_baseline_model(git_trial_id)
+                model_snapshot_path = snapshot["snapshot_path"]
+                self._trial_model_snapshots[git_trial_id] = model_snapshot_path
+                print(f"[Loop] Model branch: {branch_info['branch']}")
+                print(f"[Loop] Model snapshot: {model_snapshot_path}")
+            except Exception as e:
+                print(f"[Loop] Git MCP baseline model setup failed: {e}")
+                notify_error(str(e), f"Git MCP setup {git_trial_id}")
+                return None
 
         # ── 调用 codex_flow.run_workflow ──
         try:
             from codex_flow import run_workflow
             manifest = run_workflow(
-                experiment_dir=self.current_baseline_dir,
+                experiment_dir=self.source_experiment_dir,
                 ask=self.current_ask,
                 output_dir=output_dir,
+                previous_trial=self.current_previous_trial,
             )
             self.manifests.append(manifest)
         except Exception as e:
@@ -213,6 +265,20 @@ class AIExperimentLoop:
             return None
 
         comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+        model_diff_summary = ""
+        if self._git_mcp_enabled():
+            try:
+                diff = baseline_git_mcp.diff_trial_model_code(
+                    Path(output_dir) / self.cfg.mcp.git.trial_code_subdir
+                )
+                model_diff_summary = diff.get("summary", "")
+                print(
+                    f"[Loop] Model diff: {diff.get('changed', 0)} changed, "
+                    f"{diff.get('added', 0)} added, {diff.get('removed', 0)} removed"
+                )
+            except Exception as e:
+                model_diff_summary = f"Model diff unavailable: {e}"
+                print(f"[Loop] Git MCP diff failed: {e}")
 
         # ── 自动决策 ──
         auto_decision = comparison.get("decision", "rollback")
@@ -221,13 +287,23 @@ class AIExperimentLoop:
         # ── 飞书人审 ──
         if human_review_enabled():
             print(f"[Loop] 等待飞书人工审核...")
-            human_decision, supplement = feishu_review(
-                trial_id=trial_id,
-                ask=self.current_ask,
-                comparison=comparison,
-                round_num=self.round_num,
-                auto_suggestion=auto_decision,
-            )
+            if self._lark_mcp_enabled():
+                human_decision, supplement = feishu_review_via_mcp(
+                    trial_id=trial_id,
+                    ask=self.current_ask,
+                    comparison=comparison,
+                    round_num=self.round_num,
+                    auto_suggestion=auto_decision,
+                    model_diff_summary=model_diff_summary,
+                )
+            else:
+                human_decision, supplement = feishu_review(
+                    trial_id=trial_id,
+                    ask=self.current_ask,
+                    comparison=comparison,
+                    round_num=self.round_num,
+                    auto_suggestion=auto_decision,
+                )
             decision = human_decision or auto_decision
         else:
             decision = auto_decision
@@ -248,10 +324,12 @@ class AIExperimentLoop:
             ask=self.current_ask,
             human_supplement=supplement,
             parent_round=self._get_parent_round(decision),
+            rollback_key=self._rollback_key(),
         )
 
         # ── 通知决策结果 ──
-        notify_command_result(decision, supplement, self.round_num + 1)
+        next_round = self.round_num if decision == "rollback" else self.round_num + 1
+        notify_command_result(decision, supplement, next_round)
 
         return {
             "decision": decision,
@@ -260,6 +338,8 @@ class AIExperimentLoop:
             "output_dir": output_dir,
             "comparison": comparison,
             "auto_decision": auto_decision,
+            "model_snapshot_path": model_snapshot_path,
+            "git_trial_id": git_trial_id,
         }
 
     # ── 三态处理 ────────────────────────────────────────
@@ -268,7 +348,24 @@ class AIExperimentLoop:
         """keep: 保留当前版本, 继续前进"""
         print(f"[Loop] ✅ KEEP — {result['trial_id']} 成为新基线")
 
+        if self._git_mcp_enabled():
+            try:
+                trial_code_dir = Path(result["output_dir"]) / self.cfg.mcp.git.trial_code_subdir
+                git_trial_id = result.get("git_trial_id", result["trial_id"])
+                baseline_git_mcp.apply_trial_to_baseline(trial_code_dir, git_trial_id)
+                commit = baseline_git_mcp.commit_baseline_model_update(
+                    git_trial_id,
+                    result.get("comparison", {}),
+                    str(Path(result["output_dir"]) / "final_report.md"),
+                    result.get("supplement"),
+                )
+                print(f"[Loop] Baseline model Git commit: {commit}")
+            except Exception as e:
+                print(f"[Loop] Git MCP keep commit failed: {e}")
+                notify_error(str(e), f"Git MCP keep {result['trial_id']}")
+
         # 更新基线
+        self.current_previous_trial = result["output_dir"]
         self.current_baseline_dir = result["output_dir"]
 
         # 注入人工补充到下一轮 Ask
@@ -288,18 +385,42 @@ class AIExperimentLoop:
         target_round = self._find_reverse_target()
         print(f"[Loop] 恢复到 Round {target_round}")
 
-        try:
-            restored = self.ckpt.restore_round(target_round)
-        except (ValueError, FileNotFoundError) as e:
-            print(f"[Loop] 恢复失败: {e}")
-            notify_error(str(e), f"reverse 到 Round {target_round}")
-            self._stop(f"无法恢复到 Round {target_round}")
-            return
+        restored = None
+        if target_round > 0:
+            try:
+                restored = self.ckpt.restore_round(target_round)
+            except (ValueError, FileNotFoundError) as e:
+                print(f"[Loop] 恢复失败: {e}")
+                notify_error(str(e), f"reverse 到 Round {target_round}")
+                self._stop(f"无法恢复到 Round {target_round}")
+                return
+
+        if self._git_mcp_enabled():
+            try:
+                snapshot_path = (
+                    result.get("model_snapshot_path")
+                    or self._trial_model_snapshots.get(result.get("git_trial_id", result["trial_id"]))
+                )
+                git_trial_id = result.get("git_trial_id", result["trial_id"])
+                if snapshot_path:
+                    baseline_git_mcp.restore_baseline_model_snapshot(snapshot_path, git_trial_id)
+                baseline_git_mcp.discard_unaccepted_model_changes(git_trial_id)
+            except Exception as e:
+                print(f"[Loop] Git MCP reverse restore failed: {e}")
+                notify_error(str(e), f"Git MCP reverse {result['trial_id']}")
 
         # 恢复基线
-        restored_trial_dir = self.output_base / restored["trial_id"]
-        if restored_trial_dir.exists():
-            self.current_baseline_dir = str(restored_trial_dir)
+        if restored:
+            restored_trial_dir = self.output_base / restored["trial_id"]
+            if restored_trial_dir.exists():
+                self.current_previous_trial = str(restored_trial_dir)
+                self.current_baseline_dir = str(restored_trial_dir)
+            else:
+                self.current_previous_trial = None
+                self.current_baseline_dir = self.source_experiment_dir
+        else:
+            self.current_previous_trial = None
+            self.current_baseline_dir = self.source_experiment_dir
         self.round_num = target_round
 
         # 注入人工补充 + 排除方向
@@ -312,22 +433,33 @@ class AIExperimentLoop:
             supplement,
             include_excluded=True,
         )
-        print(f"[Loop] 新基线: Round {target_round}, {restored['trial_id']}")
+        restored_name = restored["trial_id"] if restored else "initial baseline"
+        print(f"[Loop] 新基线: Round {target_round}, {restored_name}")
 
     def _on_rollback(self, result: dict) -> None:
         """rollback: 重跑本轮 (相同参数, 不改变基线)"""
         trial_id = result["trial_id"]
-        count = self.ckpt._state.rollback_count.get(trial_id, 0)
+        count = self.ckpt._state.rollback_count.get(self._rollback_key(), 0)
         print(f"[Loop] 🔄 ROLLBACK — 重跑 {trial_id} (第 {count} 次重试)")
 
         # 不改变基线、不递增 round_num
         # round_num 不变, 下一轮 _execute_one_round 会用相同的 round_num
         # 但 trial_id 会递增 (trial_counter 已增加)
+        self.round_num = max(0, self.round_num - 1)
 
         supplement = result.get("supplement")
         if supplement:
             self.current_ask = self._augment_ask(supplement)
             self.human_supplements.append(supplement)
+
+        if self._git_mcp_enabled():
+            try:
+                baseline_git_mcp.discard_unaccepted_model_changes(
+                    result.get("git_trial_id", trial_id)
+                )
+            except Exception as e:
+                print(f"[Loop] Git MCP rollback discard failed: {e}")
+                notify_error(str(e), f"Git MCP rollback {trial_id}")
 
     def _on_stop(self, result: dict) -> None:
         """stop: 结束循环"""
@@ -348,6 +480,21 @@ class AIExperimentLoop:
             # rollback: parent 不变
             return self.ckpt.current_round if self.ckpt.current_round > 0 else None
 
+    def _lark_mcp_enabled(self) -> bool:
+        return bool(
+            getattr(self.cfg, "mcp", None)
+            and self.cfg.mcp.lark.enabled
+            and feishu_review_via_mcp is not None
+        )
+
+    def _git_mcp_enabled(self) -> bool:
+        return bool(
+            getattr(self.cfg, "mcp", None)
+            and self.cfg.mcp.git.enabled
+            and self.cfg.mcp.git.scope == "baseline_model"
+            and baseline_git_mcp is not None
+        )
+
     def _find_reverse_target(self) -> int:
         """找到 reverse 的目标轮次 (最近一个 keep)"""
         kept = self.ckpt.get_keep_chain()
@@ -363,7 +510,7 @@ class AIExperimentLoop:
 
         if decision == "rollback":
             if self.ckpt.should_force_rollback_to_reverse(
-                trial_id, limits.max_rollbacks_per_round
+                self._rollback_key(), limits.max_rollbacks_per_round
             ):
                 print(
                     f"[Loop] ⚠️ rollback 次数已达上限 "
@@ -454,6 +601,11 @@ class AIExperimentLoop:
             self.round_num = 0
         else:
             self.round_num = self.ckpt.current_round
+            if self.ckpt.current_baseline_trial:
+                baseline_trial_dir = self.output_base / self.ckpt.current_baseline_trial
+                if baseline_trial_dir.exists():
+                    self.current_previous_trial = str(baseline_trial_dir)
+                    self.current_baseline_dir = str(baseline_trial_dir)
             print(f"[Loop] 从 checkpoint 恢复: Round {self.round_num}")
 
     def _on_loop_end(self) -> dict:
@@ -536,7 +688,7 @@ def main():
 
     # 加载指定配置
     if args.config:
-        reload_config(yaml_path=args.config)
+        reload_config(path=args.config)
 
     # 创建循环
     loop = AIExperimentLoop(

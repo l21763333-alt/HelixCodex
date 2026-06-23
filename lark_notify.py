@@ -421,7 +421,8 @@ def parse_feishu_card_action(payload: dict) -> dict:
 
 def notify_loop_start(experiment: str, ask: str, max_iter: int,
                       target_wape: float | None, model: str = "gpt-5.5",
-                      human_review: bool = False) -> bool:
+                      human_review: bool = False,
+                      credits: dict | None = None) -> bool:
     return send_markdown(
         f"🚀 **Codex Flow 循环启动**\n\n"
         f"| 参数 | 值 |\n|------|-----|\n"

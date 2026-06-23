@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from dataclasses import dataclass, field
 
+from openai_codex.client import CodexConfig
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "flow_config.yaml"
@@ -69,6 +71,38 @@ class PathsConfig:
 
 
 @dataclass
+class LarkMcpConfig:
+    enabled: bool = True
+    backend: str = "http"
+    server_name: str = "lark_research"
+
+
+@dataclass
+class GitMcpConfig:
+    enabled: bool = True
+    scope: str = "baseline_model"
+    repo_path: str = "."
+    baseline_dir: str = "baseline"
+    allowed_paths: list[str] = field(default_factory=lambda: [
+        "baseline/src/**",
+        "baseline/requirements.txt",
+    ])
+    trial_code_subdir: str = "agent2/code"
+    branch_prefix: str = "model-exp/"
+    remote: str = "origin"
+    base_branch: str = "main"
+    require_human_approval_for_push: bool = True
+    allow_force_push: bool = False
+    allow_reset_hard: bool = False
+
+
+@dataclass
+class McpConfig:
+    lark: LarkMcpConfig = field(default_factory=LarkMcpConfig)
+    git: GitMcpConfig = field(default_factory=GitMcpConfig)
+
+
+@dataclass
 class Config:
     model: str = "gpt-5.5"
     codex_home: str = ""
@@ -77,6 +111,7 @@ class Config:
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
     @property
     def api_key(self) -> str:
@@ -84,7 +119,27 @@ class Config:
 
     @property
     def resolved_codex_home(self) -> str:
-        return self.codex_home or str(Path.home() / ".codex")
+        if not self.codex_home:
+            return str(Path.home() / ".codex")
+        path = Path(self.codex_home).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return str(path.resolve())
+
+    def codex_config_overrides(self) -> tuple[str, ...]:
+        overrides: list[str] = []
+        if self.model:
+            overrides.append(f'model="{self.model}"')
+        return tuple(overrides)
+
+
+def build_codex_config() -> CodexConfig:
+    cfg = get_config()
+    env: dict[str, str] = {
+        "RUST_LOG": "info",
+        "CODEX_HOME": cfg.resolved_codex_home,
+    }
+    return CodexConfig(env=env, config_overrides=cfg.codex_config_overrides())
 
 
 # ============================================================
@@ -137,6 +192,20 @@ def load_config(path: Path | str | None = None) -> Config:
             if raw.get(key):
                 setattr(config, key, raw[key])
 
+        codex_section = raw.get("codex", {})
+        if isinstance(codex_section, dict):
+            if codex_section.get("model"):
+                config.model = codex_section["model"]
+            if codex_section.get("home"):
+                config.codex_home = codex_section["home"]
+
+        auth_section = raw.get("auth", {})
+        if isinstance(auth_section, dict):
+            if auth_section.get("openai_api_key"):
+                config.openai_api_key = auth_section["openai_api_key"]
+            if auth_section.get("codex_api_key"):
+                config.codex_api_key = auth_section["codex_api_key"]
+
         # 子配置 (target, source_dict, section_name, fields)
         _apply_section(config, raw, "feishu",
                        ["enabled", "app_id", "app_secret", "chat_id",
@@ -151,6 +220,14 @@ def load_config(path: Path | str | None = None) -> Config:
                        ["min_wape_improvement", "max_rounds_without_improvement"])
         _apply_section(config, raw, "paths",
                        ["experiment_dir", "runs_dir", "skills_dir"])
+        _apply_section(config.mcp, raw.get("mcp", {}), "lark",
+                       ["enabled", "backend", "server_name"])
+        _apply_section(config.mcp, raw.get("mcp", {}), "git",
+                       ["enabled", "scope", "repo_path", "baseline_dir",
+                        "allowed_paths", "trial_code_subdir", "branch_prefix",
+                        "remote", "base_branch",
+                        "require_human_approval_for_push",
+                        "allow_force_push", "allow_reset_hard"])
 
     # 环境变量覆盖
     for env_var, (section, field) in ENV_OVERRIDES.items():

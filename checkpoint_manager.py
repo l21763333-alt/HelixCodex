@@ -139,6 +139,7 @@ class LoopCheckpointManager:
         ask: str,
         human_supplement: str | None = None,
         parent_round: int | None = None,
+        rollback_key: str | None = None,
     ) -> None:
         """
         保存一轮实验的完整快照。
@@ -228,8 +229,9 @@ class LoopCheckpointManager:
             self._state.consecutive_reverses += 1
 
         elif decision == "rollback":
-            self._state.rollback_count[trial_id] = \
-                self._state.rollback_count.get(trial_id, 0) + 1
+            key = rollback_key or trial_id
+            self._state.rollback_count[key] = \
+                self._state.rollback_count.get(key, 0) + 1
 
         self._save()
         print(f"[Checkpoint] Round {round_num} ({decision}) 已保存 → {ckpt_dir}")

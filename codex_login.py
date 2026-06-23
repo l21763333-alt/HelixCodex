@@ -14,34 +14,48 @@ import sys
 from pathlib import Path
 from openai_codex import Codex
 from openai_codex.client import CodexConfig
-from config import get_config
+from config import build_codex_config
 
 
 def _build_codex_config() -> CodexConfig:
-    env: dict[str, str] = {"RUST_LOG": "info"}
-    env["CODEX_HOME"] = get_config().resolved_codex_home
-    return CodexConfig(env=env)
+    return build_codex_config()
 
 CODEX_CONFIG = _build_codex_config()
 
 
 def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Codex 设备码登录")
+    parser.add_argument("--logout", action="store_true", help="强制退出当前账号, 重新登录")
+    args = parser.parse_args()
+
     print("Codex 设备码登录 (一次性)")
     print(f"CODEX_HOME: {CODEX_CONFIG.env.get('CODEX_HOME')}")
     print("=" * 50)
 
     with Codex(config=CODEX_CONFIG) as codex:
-        # 先检查已有 session 是否实际可用 (直接跑模型调用)
-        try:
-            t = codex.thread_start()
-            r = t.run("回复: OK")
-            if r.final_response and "OK" in (r.final_response or "").upper():
-                print("[Auth] ✅ 已有可用 session, 无需重新登录")
-                return 0
-        except Exception:
-            pass
+        # ── 强制退出 ──
+        if args.logout:
+            print("[Auth] 强制退出当前账号...")
+            try:
+                codex.logout()
+                print("[Auth] ✅ 已退出")
+            except Exception as e:
+                print(f"[Auth] ⚠️ 退出失败 (可能未登录): {e}")
+
+        # ── 检查已有 session 是否实际可用 ──
+        if not args.logout:
+            try:
+                t = codex.thread_start()
+                r = t.run("回复: OK")
+                if r.final_response and "OK" in (r.final_response or "").upper():
+                    print("[Auth] ✅ 已有可用 session, 无需重新登录")
+                    return 0
+            except Exception:
+                pass
 
         # 设备码登录
+        print("[Auth] 启动设备码登录...")
         handle = codex.login_chatgpt_device_code()
         print(f"\n  请在浏览器中打开: {handle.verification_url}")
         print(f"  输入验证码: {handle.user_code}\n")
