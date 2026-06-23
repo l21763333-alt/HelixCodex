@@ -25,10 +25,10 @@ auth:
 # ── 飞书集成 ───────────────────────────────────────────────
 feishu:
   enabled: true            # 是否启用飞书通知
-  app_id: ""
-  app_secret: ""                                            # 设置环境变量 FEISHU_APP_SECRET
-  chat_id: ""  # 目标群聊 ID (oc_xxx)
-  verification_token: ""                                   # 设置环境变量 FEISHU_VERIFICATION_TOKEN
+  app_id: "cli_aab265dad8bf9cb3"
+  app_secret: ""                            # 从环境变量 FEISHU_APP_SECRET 注入
+  chat_id: "oc_f68aa0f27b4e5aa077b962a510f8ae4f"
+  verification_token: ""                    # 从环境变量 FEISHU_VERIFICATION_TOKEN 注入
 
   # 消息接收 (轮询模式, 零外部依赖)
   poll_interval: 5         # 轮询间隔 (秒)
@@ -42,7 +42,7 @@ loop:
   # 🔍 人工审核 (human-in-the-loop)
   human_review:
     enabled: true          # 是否启用飞书人审
-    timeout: 1800          # 等待回复超时 (秒), 0 = 无限等待
+    timeout: 0          # 等待回复超时 (秒), 0 = 无限等待
     auto_fallback: true    # 超时后使用自动建议继续
     authorized_senders: [] # 限定可发指令的用户 open_id, 空 = 群内任何人
 
@@ -53,7 +53,7 @@ loop:
 
   # 📉 收敛策略
   convergence:
-    min_wape_improvement: 0.005   # 最小 WAPE 改善阈值
+    min_wape_improvement: 0.0005   # 最小 WAPE 改善阈值
     max_rounds_without_improvement: 2  # 连续无改善轮次则停止
 
 # ── 项目路径 ───────────────────────────────────────────────
