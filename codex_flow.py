@@ -160,7 +160,8 @@ def _read_rate_limits(codex: Codex) -> dict:
     """调用 account/rateLimits/read RPC, 返回额度快照
 
     Returns:
-        {has_credits, unlimited, balance, used_percent, resets_at, rate_limit_type}
+        {has_credits, unlimited, balance, used_percent, resets_at, rate_limit_type,
+         raw_snap}  ← raw_snap 用于诊断
         resets_at 为 Unix 时间戳 (int) 或 None
     """
     try:
@@ -171,6 +172,42 @@ def _read_rate_limits(codex: Codex) -> dict:
         snap = resp.rate_limits
         credits = snap.credits
         primary = snap.primary
+        secondary = snap.secondary
+
+        # ── 诊断: 完整 dump 原始响应 (首次或每次, 方便定位) ──
+        print(
+            f"[Credits:diagnose] "
+            f"has_credits={credits.has_credits if credits else 'N/A'} "
+            f"unlimited={credits.unlimited if credits else 'N/A'} "
+            f"balance={credits.balance if credits else 'N/A'} "
+            f"credits_is_none={credits is None}"
+        )
+        print(
+            f"[Credits:diagnose] "
+            f"primary: used={primary.used_percent if primary else '?'}% "
+            f"resets_at={primary.resets_at if primary else '?'} "
+            f"window_mins={primary.window_duration_mins if primary else '?'} "
+            f"is_none={primary is None}"
+        )
+        print(
+            f"[Credits:diagnose] "
+            f"secondary: used={secondary.used_percent if secondary else '?'}% "
+            f"resets_at={secondary.resets_at if secondary else '?'} "
+            f"is_none={secondary is None}"
+        )
+        print(
+            f"[Credits:diagnose] "
+            f"rate_limit_reached_type={snap.rate_limit_reached_type} "
+            f"plan_type={snap.plan_type} "
+            f"limit_name={snap.limit_name} "
+            f"limit_id={snap.limit_id}"
+        )
+        # 多 bucket 视图 (例如 codex / gpt-5 / etc.)
+        by_limit = resp.rate_limits_by_limit_id
+        if by_limit:
+            for lid, info in by_limit.items():
+                print(f"[Credits:diagnose] bucket[{lid}]: {info}")
+
         return {
             "has_credits": credits.has_credits if credits else True,
             "unlimited": credits.unlimited if credits else False,
@@ -196,35 +233,72 @@ def _ensure_credits(
 ) -> dict:
     """阻塞直到账户额度可用, 返回额度快照
 
-    额度不足时原地 sleep (不重启 session), 醒来后重试。
-    max_sleep_hours 限制最长等待时间, 超过则抛异常。
+    判断逻辑 (按优先级):
+      1. rate_limit_reached_type 为 None → 无限流 → 直接放行
+         (has_credits=False 对 API Key 后付费账户是正常的, 只表示无预充值余额)
+      2. workspace_*_credits_depleted → 硬耗尽 → 立即报错
+      3. rate_limit_reached / usage_limit_reached → 临时限流 → 等待
+
+    关键认知: has_credits 只对预付费 credits 系统有意义; API Key 后付费账户
+    的 has_credits 永远为 False, 真正的限流信号是 rate_limit_reached_type。
     """
+    HARD_DEPLETION_TYPES = {
+        "workspace_owner_credits_depleted",
+        "workspace_member_credits_depleted",
+    }
+
+    started_at = time.time()
+
     while True:
         credits = _read_rate_limits(codex)
-        if credits["has_credits"] or credits["unlimited"]:
+        rate_type = credits.get("rate_limit_type")
+
+        # ── 第 1 优先: 无限流 → 放行 (不管 has_credits) ──
+        # has_credits=False 对非预付费账户是正常状态, 不表示"耗尽"
+        if rate_type is None:
+            print(f"[Credits] ✅ 无限流 (rate_limit_type=None), 放行")
             return credits
 
+        # ── 有显式限流, 检查是否可恢复 ──
+        elapsed_h = (time.time() - started_at) / 3600
+
+        # ── 第 2 优先: 硬额度耗尽 → 立即报错 ──
+        if rate_type in HARD_DEPLETION_TYPES:
+            raise RuntimeError(
+                f"[Credits] ❌ 账户额度已耗尽 (类型: {rate_type}).\n"
+                f"  这不是临时限流, 等待不会恢复.\n"
+                f"  请前往 Codex 控制台充值, 或更换 API Key."
+            )
+
+        # ── 第 3 优先: 累计等待超时 ──
+        if elapsed_h > max_sleep_hours:
+            raise RuntimeError(
+                f"[Credits] 累计等待 {elapsed_h:.1f}h 超过上限 "
+                f"{max_sleep_hours}h (类型: {rate_type}), 终止循环"
+            )
+
+        # ── 计算等待时间 (primary.resets_at 是速率窗口重置时间) ──
         wait_s: float = 3600  # 默认等 1h
         if credits["resets_at"] is not None:
             wait_s = max(float(credits["resets_at"]) - time.time(), 0)
         if wait_s > max_sleep_hours * 3600:
             raise RuntimeError(
-                f"[Credits] 额度恢复时间 {wait_s/3600:.1f}h 超过上限 "
-                f"{max_sleep_hours}h, 终止循环"
+                f"[Credits] 速率窗口恢复需 {wait_s/3600:.1f}h, "
+                f"超过上限 {max_sleep_hours}h, 终止循环"
             )
+
         if wait_s < 10:
-            # 即将 reset, 短轮询
             time.sleep(10)
             continue
 
-        wait_h = wait_s / 3600
         reset_str = (
             time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + wait_s))
         )
         msg = (
-            f"💰 额度耗尽, 预计 {wait_h:.1f}h 后恢复\n"
-            f"  恢复时间: {reset_str}\n"
-            f"  余额: {credits.get('balance', 'N/A')}"
+            f"💰 速率受限 (类型: {rate_type})\n"
+            f"  速率窗口恢复: {reset_str} (约 {wait_s/3600:.1f}h)\n"
+            f"  速率窗口用量: {credits.get('used_percent', '?')}%\n"
+            f"  已累计等待: {elapsed_h:.1f}h / {max_sleep_hours}h"
         )
         print(f"[Credits] {msg}")
         if notify:
@@ -233,7 +307,6 @@ def _ensure_credits(
             except Exception:
                 pass
 
-        # 多睡 60s 确保 bucket 已重置
         time.sleep(min(wait_s + 60, max_sleep_hours * 3600))
 
 
@@ -399,10 +472,10 @@ train_command:
   - "{output_dir}/outputs/real_outputs"
   - "--history_eval_only"
   - "--backtest_output_prefix"
-  - "trial_{trial_id}"
+  - "{trial_id}"
 output_contract:
-  prediction_path: "trial_{trial_id}_package_detail.csv"
-  actual_path: "trial_{trial_id}_package_detail.csv"
+  prediction_path: "{trial_id}_package_detail.csv"
+  actual_path: "{trial_id}_package_detail.csv"
 feature_changes:
   - action: ...
 ```
@@ -1352,7 +1425,7 @@ def run_loop(
                 print(f"\n[Loop] 本轮 WAPE: {current_wape:.4f} | 最佳: {best_wape:.4f}")
 
                 # ── 飞书通知: 本轮结果 ──
-                lark.notify_trial_done(trial_output, comparison, credits)
+                lark.notify_trial_done(trial_output, comparison, ask=ask)
                 # ── 飞书审批卡片 (精炼版, 含 /keep /rollback 等指令) ──
                 lark.send_review_card(trial_output)
 
@@ -1419,7 +1492,7 @@ def main() -> int:
 
     # 额度 & 通知
     parser.add_argument("--max-sleep-hours", type=float, default=24.0, help="额度耗尽最长等待小时数 (默认 24)")
-    parser.add_argument("--notify-chat-id", default=get_config().lark.chat_id, help="飞书通知群聊 ID")
+    parser.add_argument("--notify-chat-id", default=get_config().feishu.chat_id, help="飞书通知群聊 ID")
 
     # Human-in-the-loop
     parser.add_argument("--human-review", action="store_true", help="每轮 T2a 后暂停等人工确认")
