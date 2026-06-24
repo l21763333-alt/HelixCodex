@@ -6,6 +6,7 @@ from typing import Any
 from config import get_config
 from lark_notify import (
     build_trial_review_text,
+    normalize_supplement,
     notify_error,
     parse_feishu_card_action,
     parse_feishu_command,
@@ -30,7 +31,7 @@ def parse_feedback(raw_text_or_card_payload: Any, trial_id: str = "") -> dict[st
         return HumanFeedback(
             trial_id=parsed.get("trial_id") or trial_id,
             decision=_normalize_decision(parsed.get("action", "supplement")),
-            supplement=parsed.get("supplement"),
+            supplement=normalize_supplement(parsed.get("supplement")),
             reviewer=str(parsed.get("operator") or parsed.get("user_id") or ""),
             source="card",
             received_at=parsed.get("received_at") or time.time(),
@@ -45,7 +46,7 @@ def parse_feedback(raw_text_or_card_payload: Any, trial_id: str = "") -> dict[st
     return HumanFeedback(
         trial_id=trial_id,
         decision=decision,
-        supplement=parsed.get("supplement"),
+        supplement=normalize_supplement(parsed.get("supplement")),
         source="message",
         received_at=time.time(),
         raw=text,
@@ -99,9 +100,9 @@ def wait_human_feedback(
         return HumanFeedback(
             trial_id=trial_id,
             decision=_normalize_decision(command.get("action", "supplement")),
-            supplement=command.get("supplement"),
+            supplement=normalize_supplement(command.get("supplement")),
             source="card",
-            received_at=event.get("received_at") or time.time(),
+            received_at=command.get("received_at") or time.time(),
             raw=event,
         ).to_dict()
 
@@ -150,4 +151,4 @@ def feishu_review_via_mcp(
         decision = "rollback"
     if decision == "branch":
         decision = "rollback"
-    return (str(decision), feedback.get("supplement") or feedback.get("raw"))
+    return (str(decision), normalize_supplement(feedback.get("supplement")))

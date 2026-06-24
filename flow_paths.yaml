@@ -1,0 +1,42 @@
+# Codex Flow path contract.
+#
+# This file is intentionally separate from flow_config.yaml: it defines where
+# code, fixed input data, trial outputs, and global artifacts live.
+
+roots:
+  project: "."
+  baseline: "baseline"
+  runs: "runs"
+  skills: "skills"
+  codex_home: ".codex_home"
+
+data:
+  mode: "reference_only"
+  root: "baseline/data"
+  primary: "baseline/data/dish_package_feature_df.csv"
+  auxiliary:
+    - "baseline/data/holiday_imformation.csv"
+
+model:
+  source_dir: "baseline/src"
+  requirements: "baseline/requirements.txt"
+  publish_allowed_paths:
+    - "baseline/src/**"
+    - "baseline/requirements.txt"
+
+trial:
+  code_dir: "candidate/code"
+  legacy_code_dir: "agent2/code"
+  outputs_dir: "outputs/real_outputs"
+  inputs_dir: "inputs"
+  evaluation_dir: "evaluation"
+  logs_dir: "logs"
+  reports_dir: "reports"
+  standardized_dir: "standardized"
+  checkpoint_dir: ".checkpoint"
+
+global_artifacts:
+  model_snapshots_dir: "runs/model_code_snapshots"
+  git_action_log: "runs/git_action_log.jsonl"
+  feishu_action_log: "runs/feishu_card_actions.jsonl"
+  pr_drafts_dir: "runs/pr_drafts"

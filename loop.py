@@ -28,14 +28,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import get_config, reload_config
+from config import get_config, get_paths, reload_config
 from lark_notify import (
     feishu_review,
     notify_loop_start,
     notify_loop_stop,
     notify_error,
     notify_command_result,
+    notify_git_publish_result,
+    notify_git_sync_result,
+    notify_stage_interrupted,
+    wait_for_recovery_event,
     human_review_enabled,
+    normalize_supplement,
 )
 from checkpoint_manager import LoopCheckpointManager
 
@@ -48,6 +53,11 @@ try:
     from mcp_servers.git_research_server import server as baseline_git_mcp
 except Exception:  # pragma: no cover - optional adapter fallback
     baseline_git_mcp = None
+
+try:
+    import git_subagent
+except Exception:  # pragma: no cover - optional adapter fallback
+    git_subagent = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -114,6 +124,7 @@ class AIExperimentLoop:
         self.should_stop: bool = False
         self.manifests: list[Any] = []
         self._trial_model_snapshots: dict[str, str] = {}
+        self._restore_from_checkpoint_state()
 
     @staticmethod
     def _make_run_label(output_base: Path) -> str:
@@ -135,6 +146,35 @@ class AIExperimentLoop:
             except (IndexError, ValueError):
                 continue
         return max_seen
+
+    def _restore_from_checkpoint_state(self) -> None:
+        """Resume loop counters and baseline from runs/.loop_state.json when present."""
+        if self.ckpt.current_round <= 0 and not self.ckpt.current_baseline_trial:
+            return
+
+        self.round_num = max(self.round_num, self.ckpt.current_round)
+        baseline_trial = self.ckpt.current_baseline_trial
+        if baseline_trial:
+            baseline_dir = self.output_base / baseline_trial
+            if baseline_dir.exists():
+                self.current_previous_trial = str(baseline_dir)
+                self.current_baseline_dir = str(baseline_dir)
+            else:
+                print(f"[Loop] ⚠️ checkpoint baseline missing: {baseline_dir}")
+
+        supplements = []
+        for item in self.ckpt.lineage:
+            supp = normalize_supplement(item.get("human_supplement"))
+            if supp:
+                supplements.append(supp)
+        self.human_supplements = supplements
+        if supplements:
+            self.current_ask = self._augment_ask()
+
+        print(
+            f"[Loop] Resume checkpoint: round={self.round_num}, "
+            f"baseline={baseline_trial or '(initial)'}, next_trial={self.trial_counter + 1:03d}"
+        )
 
     # ── 主循环 ──────────────────────────────────────────
 
@@ -232,6 +272,10 @@ class AIExperimentLoop:
         git_trial_id = self._git_trial_id(trial_id)
         if self._git_mcp_enabled():
             try:
+                if self.cfg.mcp.git.sync_before_each_trial and not self.current_previous_trial:
+                    sync = self._sync_remote_base("before_trial")
+                    if sync and not sync.get("ok", False):
+                        return None
                 branch_info = baseline_git_mcp.create_model_trial_branch(git_trial_id)
                 snapshot = baseline_git_mcp.snapshot_baseline_model(git_trial_id)
                 model_snapshot_path = snapshot["snapshot_path"]
@@ -245,21 +289,75 @@ class AIExperimentLoop:
 
         # ── 调用 codex_flow.run_workflow ──
         try:
-            from codex_flow import run_workflow
-            manifest = run_workflow(
-                experiment_dir=self.source_experiment_dir,
-                ask=self.current_ask,
-                output_dir=output_dir,
-                previous_trial=self.current_previous_trial,
-            )
-            self.manifests.append(manifest)
+            import codex_flow as flow
+            stage_interrupted_error = getattr(flow, "StageInterrupted", RuntimeError)
+            resume_from_phase = None
+
+            def _call_workflow(phase: str | None):
+                kwargs = dict(
+                    experiment_dir=self.source_experiment_dir,
+                    ask=self.current_ask,
+                    output_dir=output_dir,
+                    previous_trial=self.current_previous_trial,
+                )
+                try:
+                    return flow.run_workflow(
+                        **kwargs,
+                        resume=True,
+                        resume_from_phase=phase,
+                    )
+                except TypeError as e:
+                    if "unexpected keyword" not in str(e):
+                        raise
+                    return flow.run_workflow(**kwargs)
+
+            while True:
+                try:
+                    manifest = _call_workflow(resume_from_phase)
+                    self.manifests.append(manifest)
+                    break
+                except stage_interrupted_error as interrupted:
+                    print(f"[Loop] Stage interrupted: {interrupted.phase} — {interrupted.error}")
+                    cmd = self._wait_for_stage_recovery(interrupted)
+                    action = str(cmd.get("action", "stop"))
+                    phase = str(cmd.get("phase") or interrupted.phase)
+                    if action == "status":
+                        notify_error(
+                            f"Interrupted stage: {interrupted.phase}\n"
+                            f"Action needed: /resume /retry-stage {interrupted.phase} "
+                            f"/skip-stage {interrupted.phase} /stop",
+                            f"Round {self.round_num} {trial_id}",
+                        )
+                        continue
+                    if action == "stop":
+                        return {
+                            "decision": "stop",
+                            "supplement": normalize_supplement(cmd.get("supplement")) or "用户停止阶段恢复",
+                            "trial_id": trial_id,
+                            "output_dir": output_dir,
+                            "comparison": {},
+                            "auto_decision": "stop",
+                            "model_snapshot_path": model_snapshot_path,
+                            "git_trial_id": git_trial_id,
+                        }
+                    if action == "skip-stage":
+                        if self._skip_degraded_stage(interrupted, phase):
+                            manifest = flow.WorkflowManifest.load(output_dir)
+                            if manifest:
+                                self.manifests.append(manifest)
+                            break
+                        continue
+                    if action in {"resume", "retry-stage"}:
+                        resume_from_phase = phase or interrupted.phase
+                        continue
+                    notify_error(f"unknown recovery action: {cmd}", f"Round {self.round_num} {trial_id}")
         except Exception as e:
             print(f"[Loop] 实验执行失败: {e}")
             notify_error(str(e), f"Round {self.round_num} {trial_id}")
             return None
 
         # ── 读取 comparison 结果 ──
-        comparison_path = Path(output_dir) / "evaluation" / "metric_comparison.json"
+        comparison_path = get_paths().trial_evaluation_dir(output_dir) / "metric_comparison.json"
         if not comparison_path.exists():
             print(f"[Loop] comparison 缺失: {comparison_path}")
             return None
@@ -269,7 +367,7 @@ class AIExperimentLoop:
         if self._git_mcp_enabled():
             try:
                 diff = baseline_git_mcp.diff_trial_model_code(
-                    Path(output_dir) / self.cfg.mcp.git.trial_code_subdir
+                    get_paths().existing_trial_code_dir(output_dir)
                 )
                 model_diff_summary = diff.get("summary", "")
                 print(
@@ -309,12 +407,13 @@ class AIExperimentLoop:
             decision = auto_decision
             supplement = None
             print(f"[Loop] 人审关闭, 直接使用自动建议")
+        supplement = normalize_supplement(supplement)
 
         # ── 安全限制检查 ──
         decision = self._enforce_safety_limits(trial_id, decision)
 
         # ── 保存 checkpoint ──
-        code_dir = Path(output_dir) / "agent2" / "code"
+        code_dir = get_paths().existing_trial_code_dir(output_dir)
         self.ckpt.save_round(
             trial_id=trial_id,
             round_num=self.round_num,
@@ -350,7 +449,7 @@ class AIExperimentLoop:
 
         if self._git_mcp_enabled():
             try:
-                trial_code_dir = Path(result["output_dir"]) / self.cfg.mcp.git.trial_code_subdir
+                trial_code_dir = get_paths().existing_trial_code_dir(result["output_dir"])
                 git_trial_id = result.get("git_trial_id", result["trial_id"])
                 baseline_git_mcp.apply_trial_to_baseline(trial_code_dir, git_trial_id)
                 commit = baseline_git_mcp.commit_baseline_model_update(
@@ -360,6 +459,7 @@ class AIExperimentLoop:
                     result.get("supplement"),
                 )
                 print(f"[Loop] Baseline model Git commit: {commit}")
+                self._publish_committed_keep(result, commit)
             except Exception as e:
                 print(f"[Loop] Git MCP keep commit failed: {e}")
                 notify_error(str(e), f"Git MCP keep {result['trial_id']}")
@@ -370,6 +470,7 @@ class AIExperimentLoop:
 
         # 注入人工补充到下一轮 Ask
         supplement = result.get("supplement")
+        supplement = normalize_supplement(supplement)
         if supplement:
             self.human_supplements.append(supplement)
             self.current_ask = self._augment_ask(supplement)
@@ -425,6 +526,7 @@ class AIExperimentLoop:
 
         # 注入人工补充 + 排除方向
         supplement = result.get("supplement")
+        supplement = normalize_supplement(supplement)
         if supplement:
             self.human_supplements.append(supplement)
 
@@ -448,6 +550,7 @@ class AIExperimentLoop:
         self.round_num = max(0, self.round_num - 1)
 
         supplement = result.get("supplement")
+        supplement = normalize_supplement(supplement)
         if supplement:
             self.current_ask = self._augment_ask(supplement)
             self.human_supplements.append(supplement)
@@ -463,7 +566,7 @@ class AIExperimentLoop:
 
     def _on_stop(self, result: dict) -> None:
         """stop: 结束循环"""
-        reason = result.get("supplement") or "用户指令"
+        reason = normalize_supplement(result.get("supplement")) or "用户指令"
         self._stop(reason)
 
     # ── 辅助方法 ────────────────────────────────────────
@@ -479,6 +582,218 @@ class AIExperimentLoop:
         else:
             # rollback: parent 不变
             return self.ckpt.current_round if self.ckpt.current_round > 0 else None
+
+    def _wait_for_stage_recovery(self, interrupted) -> dict:
+        """Send a recovery card and wait for a Feishu recovery command."""
+        trial_id = getattr(interrupted, "trial_id", "")
+        phase = getattr(interrupted, "phase", "")
+        error = getattr(interrupted, "error", str(interrupted))
+        if not human_review_enabled():
+            return {"action": "stop", "phase": phase, "supplement": "stage recovery requires Feishu review"}
+
+        notify_stage_interrupted(trial_id, phase, error)
+        recovery_cfg = self.cfg.recovery
+        cmd = wait_for_recovery_event(
+            self.cfg.feishu.chat_id,
+            trial_id,
+            phase,
+            timeout=recovery_cfg.manual_timeout,
+            poll_interval=self.cfg.feishu.poll_interval,
+            sender_filter=self.cfg.loop.human_review.authorized_senders or None,
+        )
+        if not cmd:
+            return {"action": "stop", "phase": phase, "supplement": "stage recovery timed out"}
+        return cmd
+
+    def _skip_degraded_stage(self, interrupted, phase: str) -> bool:
+        """Mark a degradable stage as skipped/degraded so the round can continue."""
+        if phase not in self.cfg.recovery.degradable_phases:
+            notify_error(f"stage {phase} is not degradable", f"Recovery {getattr(interrupted, 'trial_id', '')}")
+            return False
+        try:
+            import codex_flow as flow
+            output_dir = getattr(interrupted, "output_dir")
+            error = getattr(interrupted, "error", "manual skip")
+            manifest = flow.WorkflowManifest.load(output_dir)
+            if phase == "report":
+                flow._write_fallback_report(output_dir, f"manual skip after interruption: {error}")
+                if manifest:
+                    manifest.record_degraded("report", f"manual skip: {error}", [
+                        "final_report.md",
+                        "logs/stage_report.log",
+                    ])
+            elif phase == "feishu_card":
+                flow._write_fallback_feishu_card(output_dir, f"manual skip after interruption: {error}")
+                if manifest:
+                    manifest.record_degraded("feishu_card", f"manual skip: {error}", [
+                        "feishu_review_card.md",
+                    ])
+            return True
+        except Exception as e:
+            notify_error(str(e), f"skip-stage {phase}")
+            return False
+
+    def _sync_remote_base(self, context: str = "loop_start") -> dict | None:
+        """Synchronize baseline model from the configured remote base branch."""
+        if not self._git_mcp_enabled():
+            return None
+        if self.current_previous_trial:
+            result = {
+                "ok": True,
+                "sync": {
+                    "synced": False,
+                    "reason": "skip sync while resuming an existing keep chain",
+                    "remote": self.cfg.mcp.git.remote,
+                    "base_branch": self.cfg.mcp.git.base_branch,
+                },
+            }
+            notify_git_sync_result(result)
+            return result
+        try:
+            if self.cfg.mcp.git.publish_via_subagent and git_subagent is not None:
+                try:
+                    result = git_subagent.sync_remote_base_via_subagent()
+                except Exception as subagent_error:
+                    if not hasattr(baseline_git_mcp, "sync_remote_base"):
+                        raise
+                    sync = baseline_git_mcp.sync_remote_base(
+                        self.cfg.mcp.git.remote,
+                        self.cfg.mcp.git.base_branch,
+                    )
+                    result = {
+                        "ok": bool(sync.get("synced")) and not sync.get("blocked"),
+                        "sync": sync,
+                        "fallback": "direct_git_mcp",
+                        "subagent_error": str(subagent_error),
+                    }
+            else:
+                sync = baseline_git_mcp.sync_remote_base(
+                    self.cfg.mcp.git.remote,
+                    self.cfg.mcp.git.base_branch,
+                )
+                result = {"ok": bool(sync.get("synced")) and not sync.get("blocked"), "sync": sync}
+        except Exception as e:
+            result = {"ok": False, "sync": {}, "error": str(e), "context": context}
+        notify_git_sync_result(result)
+        if not result.get("ok", False):
+            self._stop(f"Git baseline sync failed: {result.get('error') or result.get('sync', {}).get('reason')}")
+        return result
+
+    def _publish_committed_keep(self, result: dict, commit: dict) -> None:
+        """Push KEEP commit and create a draft PR after the checkpoint is saved."""
+        if not commit.get("committed"):
+            notify_git_publish_result(
+                {
+                    "ok": True,
+                    "publish": {
+                        "trial_id": result.get("trial_id"),
+                        "branch": None,
+                        "commit": commit,
+                        "push": None,
+                        "pr": None,
+                    },
+                },
+                next_baseline=result.get("output_dir"),
+            )
+            return
+
+        git_trial_id = result.get("git_trial_id", result["trial_id"])
+        branch = f"{self.cfg.mcp.git.branch_prefix}{git_trial_id}"
+        report_path = str(Path(result["output_dir"]) / "final_report.md")
+        result_path = Path(result["output_dir"]) / "git_publish_result.json"
+        try:
+            if self.cfg.mcp.git.publish_via_subagent and git_subagent is not None:
+                try:
+                    publish = git_subagent.publish_existing_keep_via_subagent(
+                        trial_id=git_trial_id,
+                        branch=branch,
+                        metrics=result.get("comparison", {}),
+                        report_path=report_path,
+                        supplement=result.get("supplement"),
+                        commit=commit,
+                        result_path=result_path,
+                    )
+                except Exception as subagent_error:
+                    push = None
+                    pr = None
+                    if self.cfg.mcp.git.push_on_keep:
+                        push = baseline_git_mcp.push_model_trial_branch(
+                            branch=branch,
+                            remote=self.cfg.mcp.git.remote,
+                            target_branch=self.cfg.mcp.git.push_target_branch or None,
+                        )
+                    if self.cfg.mcp.git.create_pr_on_keep:
+                        pr = baseline_git_mcp.create_model_pr(
+                            branch=branch,
+                            base=self.cfg.mcp.git.base_branch,
+                            body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
+                            title=f"forecast: keep {git_trial_id}",
+                            draft=self.cfg.mcp.git.pr_draft,
+                        )
+                    publish = {
+                        "ok": True,
+                        "operation": "publish_existing_keep",
+                        "fallback": "direct_git_mcp",
+                        "subagent_error": str(subagent_error),
+                        "publish": {
+                            "trial_id": git_trial_id,
+                            "branch": branch,
+                            "commit": commit,
+                            "push": push,
+                            "pr": pr,
+                        },
+                        "state": baseline_git_mcp.get_model_repo_state(),
+                        "error": None,
+                    }
+                    result_path.write_text(json.dumps(publish, indent=2, ensure_ascii=False), encoding="utf-8")
+            else:
+                push = None
+                pr = None
+                if self.cfg.mcp.git.push_on_keep:
+                    push = baseline_git_mcp.push_model_trial_branch(
+                        branch=branch,
+                        remote=self.cfg.mcp.git.remote,
+                        target_branch=self.cfg.mcp.git.push_target_branch or None,
+                    )
+                if self.cfg.mcp.git.create_pr_on_keep:
+                    pr = baseline_git_mcp.create_model_pr(
+                        branch=branch,
+                        base=self.cfg.mcp.git.base_branch,
+                        body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
+                        title=f"forecast: keep {git_trial_id}",
+                        draft=self.cfg.mcp.git.pr_draft,
+                    )
+                publish = {
+                    "ok": True,
+                    "operation": "publish_existing_keep",
+                    "publish": {
+                        "trial_id": git_trial_id,
+                        "branch": branch,
+                        "commit": commit,
+                        "push": push,
+                        "pr": pr,
+                    },
+                    "state": baseline_git_mcp.get_model_repo_state(),
+                    "error": None,
+                }
+                result_path.write_text(json.dumps(publish, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            publish = {
+                "ok": False,
+                "operation": "publish_existing_keep",
+                "publish": {
+                    "trial_id": git_trial_id,
+                    "branch": branch,
+                    "commit": commit,
+                    "push": None,
+                    "pr": None,
+                },
+                "error": str(e),
+            }
+            result_path.write_text(json.dumps(publish, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"[Loop] Git publish failed: {e}")
+            notify_error(str(e), f"Git publish {result['trial_id']}")
+        notify_git_publish_result(publish, next_baseline=result.get("output_dir"))
 
     def _lark_mcp_enabled(self) -> bool:
         return bool(
@@ -535,6 +850,7 @@ class AIExperimentLoop:
         parts = [self.original_ask]
 
         # 最新人工补充
+        supplement = normalize_supplement(supplement)
         if supplement:
             parts.append(f"\n💬 人工补充: {supplement}")
 
@@ -595,6 +911,11 @@ class AIExperimentLoop:
             model=self.cfg.model,
             human_review=hr_enabled,
         )
+
+        if self._git_mcp_enabled() and self.cfg.mcp.git.sync_on_loop_start:
+            self._sync_remote_base("loop_start")
+            if self.should_stop:
+                return
 
         # 初始化 checkpoint
         if self.ckpt.current_round == 0:

@@ -22,7 +22,8 @@ from config import get_config
 from lark_notify import parse_feishu_card_action, send_review_card_text
 
 
-ACTION_LOG = Path("runs") / "feishu_card_actions.jsonl"
+PROJECT_ROOT = Path(__file__).resolve().parent
+ACTION_LOG = PROJECT_ROOT / "runs" / "feishu_card_actions.jsonl"
 TEST_CARD = """🔬 **实验完成: trial_034**
 
 **决策建议: KEEP** | 来源: auto

@@ -3,20 +3,24 @@
 config.py — Codex Flow 统一配置加载 (flow_config.yaml)
 
 支持环境变量覆盖敏感字段 (避免写入配置文件):
-  FEISHU_APP_ID, FEISHU_APP_SECRET, OPENAI_API_KEY, CODEX_API_KEY, CODEX_HOME, CODEX_MODEL
+  FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_CHAT_ID,
+  FEISHU_VERIFICATION_TOKEN, OPENAI_API_KEY, CODEX_API_KEY,
+  CODEX_HOME, CODEX_MODEL
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from openai_codex.client import CodexConfig
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "flow_config.yaml"
+PATH_CONFIG_PATH = PROJECT_ROOT / "flow_paths.yaml"
+LOCAL_PATH_CONFIG_PATH = PROJECT_ROOT / "flow_paths.local.yaml"
 
 
 # ============================================================
@@ -54,6 +58,21 @@ class LoopConvergenceConfig:
 
 
 @dataclass
+class RecoveryConfig:
+    enabled: bool = True
+    codex_max_attempts: int = 2
+    retry_delay_seconds: int = 30
+    manual_after_attempts: bool = True
+    manual_timeout: int = 0
+    recoverable_codex_phases: list[str] = field(default_factory=lambda: [
+        "evaluate", "plan", "codegen", "report", "feishu_card",
+    ])
+    degradable_phases: list[str] = field(default_factory=lambda: [
+        "report", "feishu_card",
+    ])
+
+
+@dataclass
 class LoopConfig:
     max_iter: int = 10
     target_wape: float | None = None
@@ -68,6 +87,152 @@ class PathsConfig:
     experiment_dir: str = "baseline"
     runs_dir: str = "runs"
     skills_dir: str = "skills"
+
+
+@dataclass
+class FlowPathRoots:
+    project: str = "."
+    baseline: str = "baseline"
+    runs: str = "runs"
+    skills: str = "skills"
+    codex_home: str = ".codex_home"
+
+
+@dataclass
+class FlowPathData:
+    mode: str = "reference_only"
+    root: str = "baseline/data"
+    primary: str = "baseline/data/dish_package_feature_df.csv"
+    auxiliary: list[str] = field(default_factory=lambda: [
+        "baseline/data/holiday_imformation.csv",
+    ])
+
+
+@dataclass
+class FlowPathModel:
+    source_dir: str = "baseline/src"
+    requirements: str = "baseline/requirements.txt"
+    publish_allowed_paths: list[str] = field(default_factory=lambda: [
+        "baseline/src/**",
+        "baseline/requirements.txt",
+    ])
+
+
+@dataclass
+class FlowPathTrial:
+    code_dir: str = "candidate/code"
+    legacy_code_dir: str = "agent2/code"
+    outputs_dir: str = "outputs/real_outputs"
+    inputs_dir: str = "inputs"
+    evaluation_dir: str = "evaluation"
+    logs_dir: str = "logs"
+    reports_dir: str = "reports"
+    standardized_dir: str = "standardized"
+    checkpoint_dir: str = ".checkpoint"
+
+
+@dataclass
+class FlowPathGlobalArtifacts:
+    model_snapshots_dir: str = "runs/model_code_snapshots"
+    git_action_log: str = "runs/git_action_log.jsonl"
+    feishu_action_log: str = "runs/feishu_card_actions.jsonl"
+    pr_drafts_dir: str = "runs/pr_drafts"
+
+
+@dataclass
+class FlowPathsConfig:
+    roots: FlowPathRoots = field(default_factory=FlowPathRoots)
+    data: FlowPathData = field(default_factory=FlowPathData)
+    model: FlowPathModel = field(default_factory=FlowPathModel)
+    trial: FlowPathTrial = field(default_factory=FlowPathTrial)
+    global_artifacts: FlowPathGlobalArtifacts = field(default_factory=FlowPathGlobalArtifacts)
+
+
+class PathRegistry:
+    """Resolve Codex Flow paths from flow_paths.yaml."""
+
+    def __init__(self, cfg: FlowPathsConfig):
+        self.cfg = cfg
+
+    def abs(self, value: str | Path) -> Path:
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return path.resolve()
+        return (PROJECT_ROOT / path).resolve()
+
+    def rel(self, value: str | Path) -> str:
+        path = self.abs(value)
+        try:
+            return path.relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def trial_path(self, trial_dir: str | Path, rel_path: str) -> Path:
+        path = Path(trial_dir)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return (path / rel_path).resolve()
+
+    def trial_code_dir(self, trial_dir: str | Path) -> Path:
+        return self.trial_path(trial_dir, self.cfg.trial.code_dir)
+
+    def legacy_trial_code_dir(self, trial_dir: str | Path) -> Path:
+        return self.trial_path(trial_dir, self.cfg.trial.legacy_code_dir)
+
+    def existing_trial_code_dir(self, trial_dir: str | Path) -> Path:
+        canonical = self.trial_code_dir(trial_dir)
+        legacy = self.legacy_trial_code_dir(trial_dir)
+        return canonical if canonical.exists() else legacy
+
+    def trial_outputs_dir(self, trial_dir: str | Path) -> Path:
+        return self.trial_path(trial_dir, self.cfg.trial.outputs_dir)
+
+    def trial_inputs_dir(self, trial_dir: str | Path) -> Path:
+        return self.trial_path(trial_dir, self.cfg.trial.inputs_dir)
+
+    def trial_logs_dir(self, trial_dir: str | Path) -> Path:
+        return self.trial_path(trial_dir, self.cfg.trial.logs_dir)
+
+    def trial_evaluation_dir(self, trial_dir: str | Path) -> Path:
+        return self.trial_path(trial_dir, self.cfg.trial.evaluation_dir)
+
+    def trial_standardized_dir(self, trial_dir: str | Path) -> Path:
+        return self.trial_path(trial_dir, self.cfg.trial.standardized_dir)
+
+    def data_primary(self) -> Path:
+        return self.abs(self.cfg.data.primary)
+
+    def data_auxiliary(self) -> list[Path]:
+        return [self.abs(item) for item in self.cfg.data.auxiliary]
+
+    def model_source_dir(self) -> Path:
+        return self.abs(self.cfg.model.source_dir)
+
+    def model_requirements(self) -> Path:
+        return self.abs(self.cfg.model.requirements)
+
+    def global_artifact(self, name: str) -> Path:
+        return self.abs(getattr(self.cfg.global_artifacts, name))
+
+    def manifest_summary(self, trial_dir: str | Path) -> dict:
+        return {
+            "data": {
+                "mode": self.cfg.data.mode,
+                "primary": self.rel(self.cfg.data.primary),
+                "auxiliary": [self.rel(item) for item in self.cfg.data.auxiliary],
+            },
+            "trial": {
+                "code_dir": self.rel(self.trial_code_dir(trial_dir)),
+                "legacy_code_dir": self.rel(self.legacy_trial_code_dir(trial_dir)),
+                "outputs_dir": self.rel(self.trial_outputs_dir(trial_dir)),
+                "inputs_dir": self.rel(self.trial_inputs_dir(trial_dir)),
+            },
+            "model": {
+                "source_dir": self.rel(self.cfg.model.source_dir),
+                "requirements": self.rel(self.cfg.model.requirements),
+                "publish_allowed_paths": list(self.cfg.model.publish_allowed_paths),
+            },
+        }
 
 
 @dataclass
@@ -87,10 +252,22 @@ class GitMcpConfig:
         "baseline/src/**",
         "baseline/requirements.txt",
     ])
-    trial_code_subdir: str = "agent2/code"
+    trial_code_subdir: str = "candidate/code"
     branch_prefix: str = "model-exp/"
     remote: str = "origin"
     base_branch: str = "main"
+    sync_on_loop_start: bool = True
+    sync_before_each_trial: bool = False
+    publish_via_subagent: bool = True
+    push_on_keep: bool = True
+    create_pr_on_keep: bool = True
+    pr_draft: bool = True
+    push_target_branch: str = ""
+    server_transport: str = "stdio"
+    server_command: str = "python"
+    server_args: list[str] = field(default_factory=lambda: [
+        "-m", "mcp_servers.git_research_server.server",
+    ])
     require_human_approval_for_push: bool = True
     allow_force_push: bool = False
     allow_reset_hard: bool = False
@@ -110,6 +287,7 @@ class Config:
     codex_api_key: str = ""
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
 
@@ -119,9 +297,10 @@ class Config:
 
     @property
     def resolved_codex_home(self) -> str:
-        if not self.codex_home:
+        configured = self.codex_home or get_paths().cfg.roots.codex_home
+        if not configured:
             return str(Path.home() / ".codex")
-        path = Path(self.codex_home).expanduser()
+        path = Path(configured).expanduser()
         if not path.is_absolute():
             path = PROJECT_ROOT / path
         return str(path.resolve())
@@ -177,6 +356,54 @@ def _apply_section(config: Config, data: dict, section: str, fields: list[str]) 
             setattr(target, f, sd[f])
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _apply_dataclass_section(target, data: dict) -> None:
+    if not isinstance(data, dict):
+        return
+    for key, value in data.items():
+        if hasattr(target, key) and value is not None:
+            setattr(target, key, value)
+
+
+def _flow_paths_from_dict(raw: dict) -> FlowPathsConfig:
+    cfg = FlowPathsConfig()
+    _apply_dataclass_section(cfg.roots, raw.get("roots", {}))
+    _apply_dataclass_section(cfg.data, raw.get("data", {}))
+    _apply_dataclass_section(cfg.model, raw.get("model", {}))
+    _apply_dataclass_section(cfg.trial, raw.get("trial", {}))
+    _apply_dataclass_section(cfg.global_artifacts, raw.get("global_artifacts", {}))
+    return cfg
+
+
+def load_flow_paths(
+    path: Path | str | None = None,
+    local_path: Path | str | None = None,
+) -> FlowPathsConfig:
+    import yaml
+
+    raw = asdict(FlowPathsConfig())
+    yaml_path = Path(path) if path else PATH_CONFIG_PATH
+    if yaml_path.exists():
+        with yaml_path.open("r", encoding="utf-8") as f:
+            raw = _deep_merge(raw, yaml.safe_load(f) or {})
+
+    local_yaml = Path(local_path) if local_path else LOCAL_PATH_CONFIG_PATH
+    if local_yaml.exists():
+        with local_yaml.open("r", encoding="utf-8") as f:
+            raw = _deep_merge(raw, yaml.safe_load(f) or {})
+
+    return _flow_paths_from_dict(raw)
+
+
 def load_config(path: Path | str | None = None) -> Config:
     """从 YAML 加载配置, 环境变量可覆盖敏感字段"""
     config = Config()
@@ -207,9 +434,10 @@ def load_config(path: Path | str | None = None) -> Config:
                 config.codex_api_key = auth_section["codex_api_key"]
 
         # 子配置 (target, source_dict, section_name, fields)
-        _apply_section(config, raw, "feishu",
-                       ["enabled", "app_id", "app_secret", "chat_id",
-                        "poll_interval", "verification_token"])
+        # Feishu credentials are intentionally not loaded from YAML. Keep
+        # secrets and chat identifiers in environment variables so they do not
+        # get committed with project configuration.
+        _apply_section(config, raw, "feishu", ["enabled", "poll_interval"])
         _apply_section(config, raw, "loop",
                        ["max_iter", "target_wape", "max_sleep_hours"])
         _apply_section(config.loop, raw.get("loop", {}), "human_review",
@@ -218,6 +446,10 @@ def load_config(path: Path | str | None = None) -> Config:
                        ["max_consecutive_reverses", "max_rollbacks_per_round"])
         _apply_section(config.loop, raw.get("loop", {}), "convergence",
                        ["min_wape_improvement", "max_rounds_without_improvement"])
+        _apply_section(config, raw, "recovery",
+                       ["enabled", "codex_max_attempts", "retry_delay_seconds",
+                        "manual_after_attempts", "manual_timeout",
+                        "recoverable_codex_phases", "degradable_phases"])
         _apply_section(config, raw, "paths",
                        ["experiment_dir", "runs_dir", "skills_dir"])
         _apply_section(config.mcp, raw.get("mcp", {}), "lark",
@@ -226,6 +458,10 @@ def load_config(path: Path | str | None = None) -> Config:
                        ["enabled", "scope", "repo_path", "baseline_dir",
                         "allowed_paths", "trial_code_subdir", "branch_prefix",
                         "remote", "base_branch",
+                        "sync_on_loop_start", "sync_before_each_trial",
+                        "publish_via_subagent", "push_on_keep",
+                        "create_pr_on_keep", "pr_draft", "push_target_branch",
+                        "server_transport", "server_command", "server_args",
                         "require_human_approval_for_push",
                         "allow_force_push", "allow_reset_hard"])
 
@@ -246,6 +482,7 @@ def load_config(path: Path | str | None = None) -> Config:
 # ============================================================
 
 _config: Config | None = None
+_paths: PathRegistry | None = None
 
 
 def get_config() -> Config:
@@ -259,6 +496,22 @@ def reload_config(path: Path | str | None = None) -> Config:
     global _config
     _config = load_config(path)
     return _config
+
+
+def get_paths() -> PathRegistry:
+    global _paths
+    if _paths is None:
+        _paths = PathRegistry(load_flow_paths())
+    return _paths
+
+
+def reload_paths(
+    path: Path | str | None = None,
+    local_path: Path | str | None = None,
+) -> PathRegistry:
+    global _paths
+    _paths = PathRegistry(load_flow_paths(path, local_path))
+    return _paths
 
 
 # 便捷函数

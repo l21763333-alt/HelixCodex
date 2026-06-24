@@ -145,7 +145,7 @@ def main():
     parser.add_argument("--token", default="", help="Verification Token (默认从 flow_config.yaml 读取)")
     args = parser.parse_args()
 
-    # 从配置读取 verification_token
+    # 从环境变量读取 verification_token，经 config.py 注入到配置对象。
     token = args.token
     if not token:
         try:
@@ -156,7 +156,7 @@ def main():
 
     if not token:
         print("[Card] ⚠️ verification_token 未设置 — URL 验证将失败")
-        print("[Card] 在 flow_config.yaml 的 feishu.verification_token 中设置")
+        print("[Card] 请设置环境变量 FEISHU_VERIFICATION_TOKEN")
     else:
         print(f"[Card] verification_token: {'***' if token else '(空)'}")
 

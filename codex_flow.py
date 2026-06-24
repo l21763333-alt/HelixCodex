@@ -26,6 +26,7 @@ codex_flow.py — ComboScope Codex 多线程工作流 (轻量版)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -45,7 +46,7 @@ from openai_codex.generated.v2_all import (
     GetAccountRateLimitsResponse,
     CodexErrorInfoValue,
 )
-from config import build_codex_config, get_config
+from config import build_codex_config, get_config, get_paths
 
 # ============================================================
 # 固定路径 — skills 目录 & 确定性执行脚本
@@ -423,30 +424,30 @@ THREAD_CODEGEN = ThreadSpec(
     prompt="""\
 基于实验计划生成 trial 代码。使用 forecast-trial-codegen 规则。
 
-源码位置: {output_dir}/agent2/code/  (只能修改此目录)
+源码位置: {trial_code_dir}/  (只能修改此目录)
 实验计划: {output_dir}/agent1/experiment_plan.yaml
 特征假设: {output_dir}/agent1/feature_hypothesis.yaml
 
 必须产出 (验证通过后):
-  {output_dir}/agent2/code/train.py
+  {trial_code_dir}/train.py
   {output_dir}/agent2/agent2_execution_plan.yaml
 
 === 自验证流程 (MUST 按顺序执行) ===
 
 1. 生成 train.py, 按 experiment_plan.changes 逐条实现特征修改
-2. 语法检查: 执行 `python -m py_compile agent2/code/train.py`
+2. 语法检查: 执行 `python -m py_compile {trial_code_dir}/train.py`
    失败 → 读错误 → 修复 → 重新执行直到通过 (最多 3 次)
 3. 冒烟测试: 执行以下脚本, 确认训练入口可调用:
 ```bash
 cd {output_dir}
 python -c "
 import sys, os, pandas as pd
-sys.path.insert(0, 'agent2/code/src')
+sys.path.insert(0, r'{trial_code_dir}/src')
 from lgb_package_to_dish_online_0319 import run_online_pipeline, parse_args, apply_experiment_preset
 print('import OK')
 # 验证 args parse 正常
 parser = parse_args.__wrapped__ if hasattr(parse_args, '__wrapped__') else parse_args
-args = parser.parse_args(['--experiment', 'baseline', '--history_eval_only', '--output_dir', 'outputs/real_outputs', '--data_path', '{data_dir}/dish_package_feature_df.csv', '--backtest_output_prefix', 'smoke_test'])
+args = parser.parse_args(['--experiment', 'baseline', '--history_eval_only', '--output_dir', r'{trial_outputs_dir}', '--data_path', r'{data_path}', '--backtest_output_prefix', 'smoke_test'])
 args = apply_experiment_preset(args)
 print(f'args OK: experiment={{args.experiment}}, objective={{args.objective}}')
 ```
@@ -461,13 +462,13 @@ source_entrypoint: "src/lgb_package_to_dish_online_0319.py"
 python_dependencies: ["src/util.py", "src/check_input.py"]
 train_command:
   - "python"
-  - "{output_dir}/agent2/code/train.py"
+  - "{trial_code_dir}/train.py"
   - "--experiment"
   - "baseline"
   - "--data_path"
-  - "{data_dir}/dish_package_feature_df.csv"
+  - "{data_path}"
   - "--output_dir"
-  - "{output_dir}/outputs/real_outputs"
+  - "{trial_outputs_dir}"
   - "--history_eval_only"
   - "--backtest_output_prefix"
   - "{trial_id}"
@@ -479,7 +480,8 @@ feature_changes:
 ```
 
 硬约束:
-- 只在 {output_dir}/agent2/code/ 下修改, 不访问 {experiment_dir}
+- 只在 {trial_code_dir}/ 下修改, 不访问 {experiment_dir}
+- 禁止在 {trial_code_dir}/ 下创建 data/、outputs/、logs/、__pycache__/；数据必须通过 --data_path={data_path} 读取
 - 验证未全部通过前, 不输出 agent2_execution_plan.yaml
 - pd.to_numeric() 默认返回值是标量 int, 链式 .fillna() 必崩
 """,
@@ -551,6 +553,7 @@ class WorkflowManifest:
     ask: str
     started_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S"))
     threads: dict[str, Any] = field(default_factory=dict)
+    paths: dict[str, Any] = field(default_factory=dict)
 
     def start(self, phase: str, kind: str = "codex") -> None:
         self.threads[phase] = {
@@ -583,6 +586,49 @@ class WorkflowManifest:
         self.threads[phase] = entry
         self._write()
 
+    def record_degraded(self, phase: str, error: str, artifacts: list[str],
+                        thread_id: str = "N/A (fallback deterministic)") -> None:
+        entry = dict(self.threads.get(phase, {}))
+        entry.update({
+            "status": "degraded",
+            "thread_id": thread_id,
+            "error": error,
+            "artifacts": artifacts,
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        self.threads[phase] = entry
+        self._write()
+
+    def record_interrupted(self, phase: str, error: str,
+                           thread_id: str | None = None) -> None:
+        entry = dict(self.threads.get(phase, {}))
+        attempts = int(entry.get("attempts", 0) or 0) + 1
+        entry.update({
+            "status": "interrupted",
+            "thread_id": thread_id or entry.get("thread_id"),
+            "error": error,
+            "last_error": error,
+            "attempts": attempts,
+            "recoverable": True,
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        self.threads[phase] = entry
+        self._write()
+
+    def is_completed(self, phase: str) -> bool:
+        return self.threads.get(phase, {}).get("status") == "completed"
+
+    def status(self, phase: str) -> str | None:
+        return self.threads.get(phase, {}).get("status")
+
+    def should_skip_phase(self, phase: str, *, resume: bool,
+                          resume_from_phase: str | None = None) -> bool:
+        if not resume:
+            return False
+        if resume_from_phase == phase:
+            return False
+        return self.is_completed(phase)
+
     def _write(self) -> None:
         path = Path(self.output_dir) / "workflow_manifest.json"
         path.write_text(json.dumps({
@@ -591,6 +637,7 @@ class WorkflowManifest:
             "output_dir": self.output_dir,
             "ask": self.ask,
             "started_at": self.started_at,
+            "paths": self.paths,
             "threads": self.threads,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -608,24 +655,66 @@ class WorkflowManifest:
             started_at=data["started_at"],
         )
         m.threads = data.get("threads", {})
+        m.paths = data.get("paths", {})
         return m
+
+
+class StageInterrupted(RuntimeError):
+    """Raised when a recoverable workflow stage needs manual continuation."""
+
+    def __init__(self, trial_id: str, output_dir: str, phase: str, error: str):
+        super().__init__(f"[{phase}] interrupted: {error}")
+        self.trial_id = trial_id
+        self.output_dir = output_dir
+        self.phase = phase
+        self.error = error
 
 
 # ============================================================
 # 源码复制 (T2b 前置)
 # ============================================================
 
+def _trial_code_dir(output_dir: str | Path) -> Path:
+    return get_paths().trial_code_dir(output_dir)
+
+
+def _legacy_code_dir(output_dir: str | Path) -> Path:
+    return get_paths().legacy_trial_code_dir(output_dir)
+
+
+def _existing_code_dir(output_dir: str | Path) -> Path:
+    return get_paths().existing_trial_code_dir(output_dir)
+
+
+def _trial_outputs_dir(output_dir: str | Path) -> Path:
+    return get_paths().trial_outputs_dir(output_dir)
+
+
+def _trial_inputs_dir(output_dir: str | Path) -> Path:
+    return get_paths().trial_inputs_dir(output_dir)
+
+
+def _rel_to_trial(output_dir: str | Path, path: str | Path) -> str:
+    root = Path(output_dir).resolve()
+    target = Path(path).resolve()
+    try:
+        return target.relative_to(root).as_posix()
+    except ValueError:
+        return target.as_posix()
+
+
 def copy_source_to_trial(experiment_dir: str, output_dir: str) -> list[str]:
     """将实验目录全部文件复制到 trial 目录, 返回复制的文件列表"""
     src = Path(experiment_dir)
-    dst = Path(output_dir) / "agent2" / "code"
+    dst = _trial_code_dir(output_dir)
     dst.mkdir(parents=True, exist_ok=True)
 
     # 永远跳过的目录
     SKIP_PARTS = (
         ".venv", "node_modules", "archive", ".comboscope_backups",
-        "__pycache__", ".git", ".claude", "runs",
+        "__pycache__", ".git", ".claude", "runs", "data", "outputs", "logs",
     )
+    ALLOWED_TOP = {"src", "requirements.txt", "train.py"}
 
     copied: list[str] = []
     for f in src.rglob("*"):
@@ -634,7 +723,11 @@ def copy_source_to_trial(experiment_dir: str, output_dir: str) -> list[str]:
         if any(skip in f.parts for skip in SKIP_PARTS):
             continue
         rel = f.relative_to(src)
+        if rel.parts and rel.parts[0] not in ALLOWED_TOP:
+            continue
         target = dst / rel
+        if target.exists():
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, target)
         copied.append(str(rel))
@@ -653,15 +746,15 @@ def _has_code_files(path: Path) -> bool:
 
 def _normalize_trial_code_layout(output_dir: str, *, phase: str) -> list[str]:
     """
-    Normalize legacy/misplaced trial code from <trial>/code to <trial>/agent2/code.
+    Normalize legacy/misplaced trial code from <trial>/code to the configured candidate code dir.
 
     Older skill instructions used runs/<trial>/code. The canonical layout is now
-    runs/<trial>/agent2/code. This guard makes the workflow tolerant to one bad
+    configured by flow_paths.yaml. This guard makes the workflow tolerant to one bad
     agent write while still keeping T3 strict about the canonical location.
     """
     out = Path(output_dir)
     legacy = out / "code"
-    canonical = out / "agent2" / "code"
+    canonical = _trial_code_dir(output_dir)
     moved: list[str] = []
 
     if not _has_code_files(legacy):
@@ -685,26 +778,69 @@ def _normalize_trial_code_layout(output_dir: str, *, phase: str) -> list[str]:
         moved.append(item.name)
 
     if moved:
-        print(f"[{phase}] normalized misplaced code/ -> agent2/code/: {moved}")
+        print(f"[{phase}] normalized misplaced code/ -> {get_paths().cfg.trial.code_dir}/: {moved}")
     return moved
 
 
+def _data_file_ref(path: Path) -> dict[str, Any]:
+    exists = path.exists()
+    ref: dict[str, Any] = {
+        "path": get_paths().rel(path),
+        "absolute_path": str(path),
+        "exists": exists,
+        "copied": False,
+    }
+    if not exists:
+        return ref
+    stat = path.stat()
+    ref.update({
+        "size_bytes": stat.st_size,
+        "mtime": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
+    })
+    try:
+        with path.open("rb") as f:
+            header = f.readline().strip()
+        ref["header_sha256"] = hashlib.sha256(header).hexdigest()
+        try:
+            ref["columns"] = header.decode("utf-8-sig").split(",")
+        except UnicodeDecodeError:
+            ref["columns"] = []
+    except Exception as e:
+        ref["header_error"] = str(e)
+    return ref
+
+
+def _write_data_refs(output_dir: str) -> dict[str, Any]:
+    paths = get_paths()
+    inputs_dir = _trial_inputs_dir(output_dir)
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    refs = {
+        "mode": paths.cfg.data.mode,
+        "copied": False,
+        "primary": _data_file_ref(paths.data_primary()),
+        "auxiliary": [_data_file_ref(item) for item in paths.data_auxiliary()],
+    }
+    (inputs_dir / "data_refs.json").write_text(
+        json.dumps(refs, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return refs
+
+
 def _copy_data_dir(data_dir: str, output_dir: str) -> None:
-    """将数据目录复制到 trial（如果 agent2/code/data 不存在）"""
-    dst_data = Path(output_dir) / "agent2" / "code" / "data"
-    if dst_data.exists():
-        return
-    src = Path(data_dir)
-    if not src.exists():
-        return
-    dst_data.mkdir(parents=True, exist_ok=True)
-    for f in src.rglob("*"):
-        if not f.is_file():
-            continue
-        rel = f.relative_to(src)
-        target = dst_data / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(f, target)
+    """Compatibility no-op: training data is referenced, not copied to trials."""
+    _write_data_refs(output_dir)
+
+
+def _assert_candidate_code_clean(output_dir: str) -> None:
+    code_dir = _trial_code_dir(output_dir)
+    forbidden = []
+    for name in ("data", "outputs", "logs", "__pycache__"):
+        path = code_dir / name
+        if path.exists():
+            forbidden.append(_rel_to_trial(output_dir, path))
+    if forbidden:
+        raise RuntimeError(f"candidate code contains forbidden directories: {forbidden}")
 
 
 # ============================================================
@@ -713,8 +849,10 @@ def _copy_data_dir(data_dir: str, output_dir: str) -> None:
 
 def _ensure_dirs(output_dir: str) -> None:
     """确保产物子目录存在 (与 skills 期望对齐)"""
-    for sub in ["data", "outputs/real_outputs", "agent1", "agent2/code",
-                "evaluation", "reports", "standardized", "logs", "audit"]:
+    paths = get_paths().cfg.trial
+    for sub in [paths.inputs_dir, paths.outputs_dir, paths.code_dir, paths.legacy_code_dir,
+                "agent1", "agent2", paths.evaluation_dir, paths.reports_dir,
+                paths.standardized_dir, paths.logs_dir, "audit"]:
         Path(output_dir, sub).mkdir(parents=True, exist_ok=True)
 
 
@@ -759,6 +897,84 @@ def _resolve_skill_inputs(skills: list[tuple[str, str]]) -> list[SkillInput]:
             for name, rel_path in skills]
 
 
+def _is_request_timeout(error: BaseException | str) -> bool:
+    msg = str(error).lower()
+    return (
+        isinstance(error, TimeoutError)
+        or "request timed out" in msg
+        or "timed out" in msg
+        or "timeout" in msg
+    )
+
+
+def _start_and_run_codex_thread(
+    codex: Codex,
+    spec: ThreadSpec,
+    inputs: list,
+    output_dir: str,
+    *,
+    max_attempts: int,
+    retry_delay_s: float,
+) -> tuple[Any, Any]:
+    attempts = max(1, max_attempts)
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        thread = codex.thread_start(
+            cwd=output_dir,
+            sandbox=Sandbox.full_access,
+            approval_mode=ApprovalMode.deny_all,
+        )
+        print(f"[{spec.phase}] 绛夊緟 LLM 鍝嶅簲 (attempt {attempt}/{attempts}, 鍙兘闇€瑕?30s-2min)...")
+        try:
+            result = thread.run(
+                inputs,
+                sandbox=Sandbox.full_access,
+                approval_mode=ApprovalMode.deny_all,
+            )
+            return thread, result
+        except Exception as e:
+            last_error = e
+            _dump_codex_stderr(codex, f"{spec.phase}_exception")
+            _stage_log(output_dir, spec.phase, f"attempt {attempt} exception: {e}")
+            if _is_request_timeout(e) and attempt < attempts:
+                _stage_log(output_dir, spec.phase, f"retry after timeout in {retry_delay_s:.0f}s")
+                time.sleep(retry_delay_s)
+                continue
+            raise
+    raise RuntimeError(f"[{spec.phase}] no Codex result: {last_error}")
+
+
+def _run_codex_turn_with_retry(
+    codex: Codex,
+    thread: Any,
+    spec: ThreadSpec,
+    inputs: list,
+    output_dir: str,
+    *,
+    max_attempts: int,
+    retry_delay_s: float,
+) -> Any:
+    attempts = max(1, max_attempts)
+    current_thread = thread
+    for attempt in range(1, attempts + 1):
+        try:
+            return current_thread.run(
+                inputs,
+                sandbox=Sandbox.full_access,
+                approval_mode=ApprovalMode.deny_all,
+            )
+        except Exception as e:
+            _dump_codex_stderr(codex, f"{spec.phase}_exception")
+            _stage_log(output_dir, spec.phase, f"attempt {attempt} exception: {e}")
+            if _is_request_timeout(e) and attempt < attempts:
+                _stage_log(output_dir, spec.phase, f"retry after timeout in {retry_delay_s:.0f}s")
+                time.sleep(retry_delay_s)
+                current_thread = codex.thread_resume(thread.id)
+                continue
+            raise
+    raise RuntimeError(f"[{spec.phase}] no Codex result")
+
+
 def run_codex_thread(
     codex: Codex,
     spec: ThreadSpec,
@@ -768,6 +984,8 @@ def run_codex_thread(
     ask: str,
     trial_id: str,
     data_dir: str = "",
+    max_attempts: int = 2,
+    retry_delay_s: float = 15.0,
 ) -> str:
     """启动并执行一个 Codex 子线程, 返回 thread_id"""
     prompt = spec.prompt.format(
@@ -792,7 +1010,15 @@ def run_codex_thread(
         approval_mode=ApprovalMode.deny_all,
     )
     print(f"[{spec.phase}] 等待 LLM 响应 (可能需要 30s-2min)...")
-    result = thread.run(inputs, sandbox=Sandbox.full_access, approval_mode=ApprovalMode.deny_all)
+    result = _run_codex_turn_with_retry(
+        codex,
+        thread,
+        spec,
+        inputs,
+        output_dir,
+        max_attempts=max_attempts,
+        retry_delay_s=retry_delay_s,
+    )
 
     if result.status.value == "failed":
         error_msg = result.error.message if result.error else "unknown"
@@ -895,14 +1121,21 @@ def _compute_wape_bias_from_csv(csv_path: Path, split_filter: str = "test") -> t
 
 def _resolve_train_command(train_cmd: list[Any], output: Path, trial_id: str) -> list[str]:
     """Resolve execution-plan train command against the canonical agent2/code layout."""
+    paths = get_paths()
     resolved = [
-        str(arg).format(output_dir=str(output), trial_id=trial_id)
+        str(arg).format(
+            output_dir=str(output),
+            trial_id=trial_id,
+            data_path=str(paths.data_primary()),
+            trial_code_dir=str(paths.trial_code_dir(output)),
+            trial_outputs_dir=str(paths.trial_outputs_dir(output)),
+        )
         for arg in train_cmd
     ]
     if not resolved:
         return resolved
 
-    code_dir = output / "agent2" / "code"
+    code_dir = _existing_code_dir(output)
     executable = Path(resolved[0]).name.lower()
     if executable in {"python", "python.exe", "python3", "python3.exe"}:
         resolved[0] = sys.executable
@@ -912,10 +1145,14 @@ def _resolve_train_command(train_cmd: list[Any], output: Path, trial_id: str) ->
             if not script.is_absolute():
                 normalized = script_text.replace("\\", "/")
                 candidates: list[Path] = []
-                if normalized.startswith("agent2/code/"):
+                if normalized.startswith(get_paths().cfg.trial.code_dir + "/"):
+                    candidates.append(output / script)
+                if normalized.startswith(get_paths().cfg.trial.legacy_code_dir + "/"):
                     candidates.append(output / script)
                 candidates.extend([
                     code_dir / script,
+                    _trial_code_dir(output) / script,
+                    _legacy_code_dir(output) / script,
                     output / script,
                 ])
                 for candidate in candidates:
@@ -923,10 +1160,121 @@ def _resolve_train_command(train_cmd: list[Any], output: Path, trial_id: str) ->
                         script = candidate
                         break
                 else:
-                    script = candidates[0] if normalized.startswith("agent2/code/") else code_dir / script
+                    legacy_prefix = get_paths().cfg.trial.legacy_code_dir + "/"
+                    code_prefix = get_paths().cfg.trial.code_dir + "/"
+                    script = candidates[0] if normalized.startswith((legacy_prefix, code_prefix)) else code_dir / script
             resolved[1] = str(script.resolve(strict=False))
 
+    def _set_or_append(flag: str, value: str) -> None:
+        if flag in resolved:
+            idx = resolved.index(flag)
+            if idx + 1 < len(resolved):
+                resolved[idx + 1] = value
+                return
+        resolved.extend([flag, value])
+
+    _set_or_append("--data_path", str(paths.data_primary()))
+    _set_or_append("--output_dir", str(paths.trial_outputs_dir(output)))
+
     return resolved
+
+
+def _read_json_file(path: Path, default: Any) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+def _write_fallback_report(output_dir: str, error: str) -> None:
+    output = Path(output_dir)
+    comparison = _read_json_file(output / "evaluation" / "metric_comparison.json", {})
+    run_status = _read_json_file(output / "agent2" / "run_status.json", {})
+    primary = comparison.get("primary", {})
+    secondary = comparison.get("secondary", {})
+    decision = str(comparison.get("decision", "rollback")).upper()
+    reason = comparison.get("reason", f"T4 report fallback after error: {error}")
+    lines = [
+        "# 实验验证结论报告",
+        "",
+        "> 本报告由 Python fallback 生成，因为 Codex T4 report 阶段未完成。",
+        "",
+        "## 1. 决策",
+        "",
+        f"- 决策: **{decision}**",
+        f"- 原因: {reason}",
+        f"- T4 异常: `{error}`",
+        "",
+        "## 2. 核心指标",
+        "",
+        "| 指标 | Baseline | New | Delta |",
+        "|------|----------|-----|-------|",
+        (
+            f"| WAPE | {primary.get('old_wape', 999):.4f} | "
+            f"{primary.get('new_wape', 999):.4f} | "
+            f"{comparison.get('wape_delta', 0):+.4f} |"
+        ),
+        (
+            f"| Bias | {primary.get('old_bias', 0):+.4f} | "
+            f"{primary.get('new_bias', 0):+.4f} | "
+            f"{comparison.get('bias_delta', 0):+.4f} |"
+        ),
+        "",
+        "## 3. 辅助指标",
+        "",
+        f"- store_dish_day baseline WAPE: {secondary.get('old_wape', 999):.4f}",
+        f"- store_dish_day baseline Bias: {secondary.get('old_bias', 0):+.4f}",
+        "",
+        "## 4. 执行状态",
+        "",
+        f"- 训练成功: {run_status.get('train_success', '?')}",
+        f"- 评估成功: {run_status.get('eval_success', '?')}",
+        f"- 预测文件: `{run_status.get('prediction_path', '')}`",
+        f"- 训练日志: `{run_status.get('train_log_path', 'logs/train.log')}`",
+        "",
+        "## 5. 产物索引",
+        "",
+        "- `agent2/experiment_review.md`",
+        "- `agent2/review_result.json`",
+        "- `evaluation/metric_comparison.json`",
+        "- `agent2/agent2_execution_plan.yaml`",
+        "- `workflow_manifest.json`",
+    ]
+    (output / "final_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _stage_log(output_dir, "report", f"fallback final_report.md generated after: {error}")
+
+
+def _write_fallback_feishu_card(output_dir: str, error: str) -> None:
+    output = Path(output_dir)
+    comparison = _read_json_file(output / "evaluation" / "metric_comparison.json", {})
+    primary = comparison.get("primary", {})
+    decision = str(comparison.get("decision", "rollback")).upper()
+    lines = [
+        f"**实验完成: {output.name}**",
+        "",
+        f"**决策: {decision}**",
+        "",
+        "| 指标 | Baseline | New | Delta |",
+        "|------|----------|-----|-------|",
+        (
+            f"| WAPE | {primary.get('old_wape', 999):.4f} | "
+            f"{primary.get('new_wape', 999):.4f} | "
+            f"{comparison.get('wape_delta', 0):+.4f} |"
+        ),
+        (
+            f"| Bias | {primary.get('old_bias', 0):+.4f} | "
+            f"{primary.get('new_bias', 0):+.4f} | "
+            f"{comparison.get('bias_delta', 0):+.4f} |"
+        ),
+        "",
+        f"T5 fallback: `{error}`",
+        "",
+        "请审核后回复 `/keep`、`/rollback`、`/reverse` 或 `/stop`。",
+    ]
+    (output / "feishu_review_card.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _stage_log(output_dir, "feishu-card", f"fallback feishu_review_card.md generated after: {error}")
 
 
 # ============================================================
@@ -941,6 +1289,7 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     评测脚本路径使用固定路径常量 EVAL_CALCULATE_SCRIPT。
     """
     output = Path(manifest.output_dir)
+    code_dir = _existing_code_dir(output)
     exec_plan_path = output / "agent2" / "agent2_execution_plan.yaml"
 
     if not exec_plan_path.exists():
@@ -961,12 +1310,12 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     _stage_log(str(output), "execute", f"training command: {' '.join(train_cmd)}")
     train_result = subprocess.run(
         train_cmd,
-        cwd=str(output / "agent2" / "code"),
+        cwd=str(code_dir),
         capture_output=True, text=True,
         timeout=3600,
     )
 
-    train_log = output / "logs" / "train.log"
+    train_log = get_paths().trial_logs_dir(output) / "train.log"
     train_log.write_text(
         f"STDOUT:\n{train_result.stdout}\n\nSTDERR:\n{train_result.stderr}",
         encoding="utf-8",
@@ -979,10 +1328,10 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     # ── 3. 运行评测 (固定路径: EVAL_CALCULATE_SCRIPT) ──
     output_contract = exec_plan.get("output_contract", {})
     prediction_path = (
-        output / "outputs" / "real_outputs" /
+        _trial_outputs_dir(output) /
         output_contract.get("prediction_path", "new_prediction.csv")
     )
-    actual_path = output / "standardized" / "standardized_actual.csv"
+    actual_path = get_paths().trial_standardized_dir(output) / "standardized_actual.csv"
 
     eval_success = False
     new_wape, new_bias, new_rows = 999.0, 0.0, 0  # 默认值: 训练失败时使用
@@ -1119,7 +1468,7 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
         "train_success": train_success,
         "eval_success": eval_success,
         "prediction_path": str(prediction_path),
-        "train_log_path": str(output / "logs" / "train.log"),
+        "train_log_path": str(get_paths().trial_logs_dir(output) / "train.log"),
     }
     (output / "agent2" / "run_status.json").write_text(
         json.dumps(run_status, indent=2, ensure_ascii=False),
@@ -1154,7 +1503,7 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
 - Delta:    WAPE={wape_delta:+.4f}, Bias={bias_delta:+.4f}
 
 ## 源码修改
-见 agent2/code/train.py
+见 candidate/code/train.py
 """
     (output / "agent2" / "experiment_review.md").write_text(review_md, encoding="utf-8")
 
@@ -1185,6 +1534,8 @@ def run_workflow(
     *,
     previous_trial: str | None = None,
     codex: Codex | None = None,
+    resume: bool = True,
+    resume_from_phase: str | None = None,
 ) -> WorkflowManifest:
     """
     ComboScope Codex 多线程工作流 — 单次 Codex Session
@@ -1207,37 +1558,88 @@ def run_workflow(
     prev_dir = str(Path(previous_trial).resolve()) if previous_trial else None
     is_chain = prev_dir is not None
 
-    manifest = WorkflowManifest(
-        trial_id=trial_id,
-        experiment_dir=exp_dir,
-        output_dir=out_dir,
-        ask=ask,
-    )
     _ensure_dirs(output_dir)
     _normalize_trial_code_layout(output_dir, phase="layout-preflight")
+    existing_manifest = WorkflowManifest.load(output_dir) if resume else None
+    if existing_manifest:
+        manifest = existing_manifest
+        manifest.experiment_dir = exp_dir
+        manifest.output_dir = out_dir
+        manifest.ask = ask
+    else:
+        manifest = WorkflowManifest(
+            trial_id=trial_id,
+            experiment_dir=exp_dir,
+            output_dir=out_dir,
+            ask=ask,
+        )
     manifest._write()
     if prev_dir:
         manifest.threads["_chain"] = {"previous_trial": prev_dir}
         manifest._write()
+    manifest.paths = get_paths().manifest_summary(out_dir)
+    manifest._write()
 
     # 代码来源: 链式执行从上一轮 agent2/code/ 继承, 否则从 experiment_dir 复制
-    code_src_dir = str(Path(prev_dir) / "agent2" / "code") if is_chain else exp_dir
+    code_src_dir = str(_existing_code_dir(prev_dir)) if is_chain else exp_dir
     # 数据目录始终指向原始 baseline
-    data_dir = str(Path(exp_dir) / "data")
+    data_dir = str(get_paths().abs(get_paths().cfg.data.root))
     # 旧指标来源: 链式执行读上一轮的 outputs, 否则读 baseline/outputs
-    baseline_metric_dir = str(Path(prev_dir) / "outputs" / "real_outputs") if is_chain else str(Path(exp_dir) / "outputs")
+    baseline_metric_dir = str(_trial_outputs_dir(prev_dir)) if is_chain else str(Path(exp_dir) / "outputs")
 
     # 线程公共参数
-    thread_kwargs = dict(experiment_dir=exp_dir, output_dir=out_dir, ask=ask,
-                         trial_id=trial_id, data_dir=data_dir)
+    recovery_cfg = get_config().recovery
+    thread_kwargs = dict(
+        experiment_dir=exp_dir,
+        output_dir=out_dir,
+        ask=ask,
+        trial_id=trial_id,
+        data_dir=data_dir,
+        data_path=str(get_paths().data_primary()),
+        trial_code_dir=str(_trial_code_dir(out_dir)),
+        legacy_trial_code_dir=str(_legacy_code_dir(out_dir)),
+        trial_outputs_dir=str(_trial_outputs_dir(out_dir)),
+        max_attempts=recovery_cfg.codex_max_attempts,
+        retry_delay_s=float(recovery_cfg.retry_delay_seconds),
+    )
 
     # ── 内部: T1~T4 全流程 ──
     def _run_trial_pipeline(cx: Codex) -> dict:
         """在已认证的 Codex session 上执行 T1→T2a→copy→T2b→T3→T4"""
         nonlocal manifest
+        phase_order = [
+            "evaluate", "plan", "copy_source", "codegen",
+            "execute", "report", "feishu_card",
+        ]
+
+        def _phase_index(phase: str) -> int:
+            try:
+                return phase_order.index(phase)
+            except ValueError:
+                return len(phase_order)
+
+        def _should_skip(phase: str) -> bool:
+            if not resume or not manifest.is_completed(phase):
+                return False
+            if resume_from_phase is None:
+                return True
+            return _phase_index(phase) < _phase_index(resume_from_phase)
+
+        def _completed_thread_id(phase: str) -> str | None:
+            item = manifest.threads.get(phase, {})
+            tid = item.get("thread_id")
+            return str(tid) if tid else None
+
+        def _stage_interrupted(phase: str, error: Exception) -> StageInterrupted:
+            err = str(error)
+            manifest.record_interrupted(phase, err)
+            return StageInterrupted(trial_id, output_dir, phase, err)
 
         # ── T1: Evaluate + Diagnose ──
         try:
+            if _should_skip("evaluate"):
+                _stage_log(output_dir, "evaluate", "T1 skipped by completed manifest")
+                raise StopIteration("skip:evaluate")
             manifest.start("evaluate", "codex")
             _stage_log(output_dir, "evaluate", "T1 evaluate started")
             t1_id = run_codex_thread(cx, THREAD_EVALUATE, **thread_kwargs)
@@ -1261,12 +1663,19 @@ def run_workflow(
                 "reports/optimization_suggestions.md",
                 "logs/stage_evaluate.log",
             ])
+        except StopIteration:
+            pass
         except Exception as e:
+            if recovery_cfg.enabled and _is_request_timeout(e) and "evaluate" in recovery_cfg.recoverable_codex_phases:
+                raise _stage_interrupted("evaluate", e)
             manifest.record_error("evaluate", str(e))
             raise
 
         # ── T2a: Plan ──
         try:
+            if _should_skip("plan"):
+                _stage_log(output_dir, "plan", "T2 plan skipped by completed manifest")
+                raise StopIteration("skip:plan")
             manifest.start("plan", "codex")
             _stage_log(output_dir, "plan", "T2 plan started")
             t2a_id = run_codex_thread(cx, THREAD_PLAN, **thread_kwargs)
@@ -1282,7 +1691,11 @@ def run_workflow(
                 "reports/report_context.json",
                 "logs/stage_plan.log",
             ])
+        except StopIteration:
+            pass
         except Exception as e:
+            if recovery_cfg.enabled and _is_request_timeout(e) and "plan" in recovery_cfg.recoverable_codex_phases:
+                raise _stage_interrupted("plan", e)
             manifest.record_error("plan", str(e))
             raise
 
@@ -1291,40 +1704,60 @@ def run_workflow(
         _stage_log(output_dir, "copy_source", "T2 source copy started")
         copied = copy_source_to_trial(code_src_dir, output_dir)
         _normalize_trial_code_layout(output_dir, phase="copy-source")
-        if is_chain:
-            _copy_data_dir(data_dir, output_dir)
-        print(f"\n[PRE-T2b] 已复制源码到 agent2/code/: {len(copied)} 个文件 (来源: {code_src_dir})")
+        _write_data_refs(output_dir)
+        _assert_candidate_code_clean(output_dir)
+        print(f"\n[PRE-T2b] 已复制源码到 {get_paths().cfg.trial.code_dir}/: {len(copied)} 个文件 (来源: {code_src_dir})")
         _stage_log(output_dir, "copy_source", f"copied {len(copied)} files from {code_src_dir}")
         manifest.record("copy_source", "N/A (Python deterministic)", [
-            "agent2/code",
+            get_paths().cfg.trial.code_dir,
+            f"{get_paths().cfg.trial.inputs_dir}/data_refs.json",
             "logs/stage_copy_source.log",
         ])
 
         # ── T2b: Code Generation ──
         try:
+            if _should_skip("codegen"):
+                _stage_log(output_dir, "codegen", "T2 codegen skipped by completed manifest")
+                t2b_id = _completed_thread_id("codegen") or ""
+                raise StopIteration("skip:codegen")
             manifest.start("codegen", "codex")
             _stage_log(output_dir, "codegen", "T2 codegen started")
             t2b_id = run_codex_thread(cx, THREAD_CODEGEN, **thread_kwargs)
             _normalize_trial_code_layout(output_dir, phase="codegen")
+            _assert_candidate_code_clean(output_dir)
             _require_artifacts(output_dir, [
-                "agent2/code/train.py",
+                f"{get_paths().cfg.trial.code_dir}/train.py",
                 "agent2/agent2_execution_plan.yaml",
             ], "codegen")
             manifest.record("codegen", t2b_id, [
-                "agent2/code/train.py",
+                f"{get_paths().cfg.trial.code_dir}/train.py",
                 "agent2/agent2_execution_plan.yaml",
                 "logs/stage_codegen.log",
             ])
+        except StopIteration:
+            t2b_id = _completed_thread_id("codegen") or ""
+            pass
         except Exception as e:
+            if recovery_cfg.enabled and _is_request_timeout(e) and "codegen" in recovery_cfg.recoverable_codex_phases:
+                raise _stage_interrupted("codegen", e)
             manifest.record_error("codegen", str(e))
             raise
 
         # ── T3 + codegen 回退循环 ──
-        manifest.start("execute", "python")
-        _stage_log(output_dir, "execute", "T3 execute started")
-        MAX_RETRIES = 2
+        skip_execute = _should_skip("execute")
+        if skip_execute:
+            _stage_log(output_dir, "execute", "T3 skipped by completed manifest")
+        else:
+            manifest.start("execute", "python")
+            _stage_log(output_dir, "execute", "T3 execute started")
+        MAX_RETRIES = -1 if skip_execute else 2
         train_log_path = Path(output_dir) / "logs" / "train.log"
-        comparison: dict | None = None
+        comparison_path = Path(output_dir) / "evaluation" / "metric_comparison.json"
+        comparison: dict | None = (
+            json.loads(comparison_path.read_text(encoding="utf-8"))
+            if skip_execute and comparison_path.exists()
+            else None
+        )
         for attempt in range(1 + MAX_RETRIES):
             try:
                 _stage_log(output_dir, "execute", f"T3 attempt {attempt + 1}/{1 + MAX_RETRIES}")
@@ -1353,7 +1786,7 @@ def run_workflow(
 
             if attempt >= MAX_RETRIES:
                 # 终极回退: 用原始脚本 + baseline preset 直接跑
-                src_script = Path(output_dir) / "agent2" / "code" / "src" / "lgb_package_to_dish_online_0319.py"
+                src_script = _existing_code_dir(output_dir) / "src" / "lgb_package_to_dish_online_0319.py"
                 if src_script.exists():
                     print("[T3] 回退: 使用原始训练脚本 (baseline preset, 不依赖 codegen)")
                     _stage_log(output_dir, "execute", "fallback original training script started")
@@ -1361,13 +1794,13 @@ def run_workflow(
                         sys.executable, str(src_script),
                         "--experiment", "baseline",
                         "--history_eval_only",
-                        "--data_path", f"{exp_dir}/data/dish_package_feature_df.csv",
-                        "--output_dir", str(Path(output_dir) / "outputs" / "real_outputs"),
+                        "--data_path", str(get_paths().data_primary()),
+                        "--output_dir", str(_trial_outputs_dir(output_dir)),
                         "--backtest_output_prefix", "fallback",
                     ]
                     fb_result = subprocess.run(
                         fallback_cmd,
-                        cwd=str(Path(output_dir) / "agent2" / "code"),
+                        cwd=str(_existing_code_dir(output_dir)),
                         capture_output=True, text=True, timeout=3600,
                     )
                     _stage_log(output_dir, "execute", f"fallback training finished rc={fb_result.returncode}")
@@ -1381,7 +1814,7 @@ def run_workflow(
                     )
                     if fb_result.returncode == 0:
                         print("[T3] 回退训练成功! 使用原始脚本输出计算指标")
-                        fb_pred = Path(output_dir) / "outputs" / "real_outputs" / "fallback_package_detail.csv"
+                        fb_pred = _trial_outputs_dir(output_dir) / "fallback_package_detail.csv"
                         if fb_pred.exists():
                             try:
                                 fallback_wape, fallback_bias, fallback_rows = _compute_wape_bias_from_csv(fb_pred, "test")
@@ -1426,7 +1859,7 @@ def run_workflow(
 
             fix_input = TextInput(text=(
                 f"训练失败, 以下是错误日志:\n\n```\n{error_text}\n```\n\n"
-                f"请定位错误原因, 修复 agent2/code/ 下的代码, 然后更新 agent2_execution_plan.yaml。"
+                f"请定位错误原因, 修复 {get_paths().cfg.trial.code_dir}/ 下的代码, 然后更新 agent2_execution_plan.yaml。"
                 f"只修复导致上述错误的代码, 不要重写整个文件。"
                 f"修复后重新执行验证步骤 (py_compile + 冒烟测试)。"
             ))
@@ -1447,7 +1880,7 @@ def run_workflow(
             else:
                 print(f"[codegen-retry] 修复完成, 重新执行 T3...")
                 _stage_log(output_dir, "execute", f"codegen retry thread completed attempt={attempt + 1}")
-                train_py = Path(output_dir) / "agent2" / "code" / "train.py"
+                train_py = _existing_code_dir(output_dir) / "train.py"
                 if train_py.exists():
                     import py_compile as pyc
                     try:
@@ -1462,6 +1895,9 @@ def run_workflow(
 
         # ── T4: Report ──
         try:
+            if _should_skip("report"):
+                _stage_log(output_dir, "report", "T4 report skipped by completed manifest")
+                raise StopIteration("skip:report")
             manifest.start("report", "codex")
             _stage_log(output_dir, "report", "T4 report started")
             t4_id = run_codex_thread(cx, THREAD_REPORT, **thread_kwargs)
@@ -1470,12 +1906,23 @@ def run_workflow(
                 "logs/stage_report.log",
             ])
             cx.thread_archive(t4_id)
+        except StopIteration:
+            pass
         except Exception as e:
-            manifest.record_error("report", str(e))
-            raise
+            err = str(e)
+            _write_fallback_report(output_dir, err)
+            manifest.record_degraded("report", err, [
+                "final_report.md",
+                "logs/stage_report.log",
+            ])
+            print(f"[T4] 报告生成失败, 已使用 fallback 报告继续: {err}")
 
         # ── T5: Feishu Review Card ──
         try:
+            if _should_skip("feishu_card"):
+                _stage_log(output_dir, "feishu-card", "T5 feishu card skipped by completed manifest")
+                raise StopIteration("skip:feishu_card")
+            manifest.start("feishu_card", "codex")
             t5_id = run_codex_thread(cx, THREAD_FEISHU_CARD, **thread_kwargs)
             manifest.record("feishu_card", t5_id, [
                 "feishu_review_card.md",
@@ -1489,8 +1936,14 @@ def run_workflow(
                 print(card_text)
                 print(f"{'='*50}")
             cx.thread_archive(t5_id)
+        except StopIteration:
+            pass
         except Exception as e:
-            manifest.record_error("feishu_card", str(e))
+            err = str(e)
+            _write_fallback_feishu_card(output_dir, err)
+            manifest.record_degraded("feishu_card", err, [
+                "feishu_review_card.md",
+            ])
             print(f"[T5] 卡片生成失败(非致命): {e}")
 
         return comparison

@@ -8,16 +8,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import get_config
+from config import PROJECT_ROOT, get_config, get_paths
 
 from .schemas import ModelRepoState
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RUNS_DIR = PROJECT_ROOT / "runs"
-SNAPSHOT_DIR = RUNS_DIR / "model_code_snapshots"
-ACTION_LOG = RUNS_DIR / "git_action_log.jsonl"
-
 
 def _cfg():
     return get_config().mcp.git
@@ -31,18 +24,15 @@ def _repo_path() -> Path:
 
 
 def _baseline_dir() -> Path:
-    base = Path(_cfg().baseline_dir)
-    if not base.is_absolute():
-        base = PROJECT_ROOT / base
-    return base.resolve()
+    return get_paths().abs(get_paths().cfg.roots.baseline)
 
 
 def _baseline_src() -> Path:
-    return _baseline_dir() / "src"
+    return get_paths().model_source_dir()
 
 
 def _baseline_requirements() -> Path:
-    return _baseline_dir() / "requirements.txt"
+    return get_paths().model_requirements()
 
 
 def _rel(path: Path) -> str:
@@ -50,7 +40,21 @@ def _rel(path: Path) -> str:
 
 
 def _allowed_pathspecs() -> list[str]:
-    return [_rel(_baseline_src()), _rel(_baseline_requirements())]
+    specs: list[str] = []
+    for item in get_paths().cfg.model.publish_allowed_paths:
+        if item.endswith("/**"):
+            specs.append(item[:-3])
+        else:
+            specs.append(item)
+    return specs
+
+
+def _current_branch() -> str:
+    return _run_git(["branch", "--show-current"], check=False).stdout.strip()
+
+
+def _current_head(ref: str = "HEAD") -> str:
+    return _run_git(["rev-parse", ref], check=False).stdout.strip()
 
 
 def _run_git(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -69,6 +73,7 @@ def _run_git(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
 
 
 def _log(action: str, payload: dict[str, Any]) -> None:
+    ACTION_LOG = get_paths().global_artifact("git_action_log")
     ACTION_LOG.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "action": action,
@@ -130,6 +135,7 @@ def get_model_repo_state() -> dict[str, Any]:
 
 
 def snapshot_baseline_model(label: str) -> dict[str, Any]:
+    SNAPSHOT_DIR = get_paths().global_artifact("model_snapshots_dir")
     SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
     safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:80]
     snapshot_path = SNAPSHOT_DIR / f"{int(time.time())}_{safe_label}"
@@ -234,6 +240,53 @@ def _ensure_model_paths_clean() -> None:
         )
 
 
+def sync_remote_base(remote: str | None = None, base_branch: str | None = None) -> dict[str, Any]:
+    """Fetch and fast-forward the configured base branch when model paths are clean."""
+    cfg = _cfg()
+    remote = remote or cfg.remote
+    base_branch = base_branch or cfg.base_branch
+    before = get_model_repo_state()
+    if before.get("model_dirty"):
+        payload = {
+            "synced": False,
+            "blocked": True,
+            "reason": "baseline model code has uncommitted changes",
+            "model_changes": before.get("model_changes", []),
+            "remote": remote,
+            "base_branch": base_branch,
+            "local_head": before.get("head"),
+        }
+        _log("sync_remote_base", payload)
+        return payload
+
+    _run_git(["fetch", remote, base_branch])
+    remote_ref = f"{remote}/{base_branch}"
+    remote_head = _current_head(remote_ref)
+    local_before = before.get("head", "")
+    current_branch = before.get("branch", "")
+
+    if current_branch != base_branch:
+        switched = _run_git(["switch", base_branch], check=False)
+        if switched.returncode != 0:
+            _run_git(["switch", "-c", base_branch, "--track", remote_ref])
+
+    _run_git(["merge", "--ff-only", remote_ref])
+    after = get_model_repo_state()
+    payload = {
+        "synced": True,
+        "blocked": False,
+        "remote": remote,
+        "base_branch": base_branch,
+        "remote_head": remote_head,
+        "local_head_before": local_before,
+        "local_head_after": after.get("head"),
+        "branch_before": current_branch,
+        "branch_after": after.get("branch"),
+    }
+    _log("sync_remote_base", payload)
+    return payload
+
+
 def _safe_replace_dir(src: Path, dst: Path) -> None:
     """原子化替换目录内容: 先清空目标再填充, 避免 rmtree+copytree 中间态丢失
 
@@ -309,6 +362,35 @@ def commit_baseline_model_update(
     return payload
 
 
+def push_model_trial_branch(
+    branch: str | None = None,
+    remote: str | None = None,
+    target_branch: str | None = None,
+    set_upstream: bool = True,
+) -> dict[str, Any]:
+    cfg = _cfg()
+    remote = remote or cfg.remote
+    branch = branch or _current_branch()
+    target_branch = target_branch or getattr(cfg, "push_target_branch", "") or branch
+    if not branch:
+        raise RuntimeError("cannot push: current branch is empty")
+    args = ["push"]
+    if set_upstream and target_branch == branch:
+        args.append("-u")
+    args.extend([remote, branch if target_branch == branch else f"{branch}:{target_branch}"])
+    result = _run_git(args, check=True)
+    payload = {
+        "pushed": True,
+        "remote": remote,
+        "branch": branch,
+        "target_branch": target_branch,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+    _log("push_model_trial_branch", payload)
+    return payload
+
+
 def discard_unaccepted_model_changes(trial_id: str) -> dict[str, Any]:
     _run_git(["checkout", "--", *_allowed_pathspecs()], check=False)
     state = get_model_repo_state()
@@ -338,13 +420,121 @@ def restore_baseline_model_snapshot(snapshot_path: str | Path, trial_id: str = "
     return payload
 
 
-def create_model_pr(branch: str, base: str | None = None, body: str = "") -> dict[str, Any]:
-    draft_dir = RUNS_DIR / "pr_drafts"
+def create_model_pr(
+    branch: str,
+    base: str | None = None,
+    body: str = "",
+    title: str | None = None,
+    draft: bool | None = None,
+) -> dict[str, Any]:
+    cfg = _cfg()
+    base = base or cfg.base_branch
+    draft = cfg.pr_draft if draft is None and hasattr(cfg, "pr_draft") else bool(draft)
+    title = title or f"forecast: keep {branch}"
+    gh = shutil.which("gh")
+    if gh:
+        args = [
+            "pr", "create",
+            "--base", base,
+            "--head", branch,
+            "--title", title,
+            "--body", body or f"Automated model update from {branch}.",
+        ]
+        if draft:
+            args.append("--draft")
+        result = subprocess.run(
+            [gh, *args],
+            cwd=str(_repo_path()),
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+            payload = {
+                "created": True,
+                "url": url,
+                "draft": draft,
+                "branch": branch,
+                "base": base,
+                "title": title,
+            }
+            _log("create_model_pr", payload)
+            return payload
+
+    draft_dir = get_paths().global_artifact("pr_drafts_dir")
     draft_dir.mkdir(parents=True, exist_ok=True)
     safe_branch = branch.replace("/", "_")
     path = draft_dir / f"{safe_branch}.md"
-    content = f"# Model update PR\n\nBranch: {branch}\nBase: {base or _cfg().base_branch}\n\n{body}\n"
+    content = f"# {title}\n\nBranch: {branch}\nBase: {base}\nDraft: {draft}\n\n{body}\n"
     path.write_text(content, encoding="utf-8")
-    payload = {"created": False, "draft_path": str(path), "branch": branch, "base": base or _cfg().base_branch}
+    payload = {
+        "created": False,
+        "draft_path": str(path),
+        "branch": branch,
+        "base": base,
+        "title": title,
+        "draft": draft,
+        "reason": "gh CLI unavailable or pr create failed",
+    }
     _log("create_model_pr", payload)
+    return payload
+
+
+def publish_keep_result(
+    trial_code_dir: str | Path,
+    trial_id: str,
+    metrics: dict[str, Any] | None = None,
+    report_path: str | None = None,
+    supplement: str | None = None,
+    push: bool | None = None,
+    create_pr: bool | None = None,
+) -> dict[str, Any]:
+    cfg = _cfg()
+    push = cfg.push_on_keep if push is None and hasattr(cfg, "push_on_keep") else bool(push)
+    create_pr = (
+        cfg.create_pr_on_keep
+        if create_pr is None and hasattr(cfg, "create_pr_on_keep")
+        else bool(create_pr)
+    )
+    branch = _current_branch()
+    applied = apply_trial_to_baseline(trial_code_dir, trial_id)
+    commit = commit_baseline_model_update(trial_id, metrics, report_path, supplement)
+    pushed = None
+    pr = None
+    if push and commit.get("committed"):
+        pushed = push_model_trial_branch(
+            branch=branch,
+            remote=cfg.remote,
+            target_branch=getattr(cfg, "push_target_branch", "") or None,
+        )
+    if create_pr and commit.get("committed"):
+        primary = (metrics or {}).get("primary", {})
+        body = "\n".join([
+            f"Trial: {trial_id}",
+            f"Branch: {branch}",
+            f"Commit: {commit.get('commit')}",
+            f"Old WAPE: {primary.get('old_wape')}",
+            f"New WAPE: {primary.get('new_wape')}",
+            f"Old Bias: {primary.get('old_bias')}",
+            f"New Bias: {primary.get('new_bias')}",
+            f"Report: {report_path or ''}",
+            f"Supplement: {supplement or ''}",
+        ])
+        pr = create_model_pr(
+            branch=branch,
+            base=cfg.base_branch,
+            body=body,
+            title=f"forecast: keep {trial_id}",
+            draft=cfg.pr_draft if hasattr(cfg, "pr_draft") else True,
+        )
+    payload = {
+        "trial_id": trial_id,
+        "branch": branch,
+        "applied": applied,
+        "commit": commit,
+        "push": pushed,
+        "pr": pr,
+        "state": get_model_repo_state(),
+    }
+    _log("publish_keep_result", payload)
     return payload

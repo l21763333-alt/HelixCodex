@@ -30,6 +30,7 @@ baseline/outputs/
 # ============================================================
 .codex_session.json
 .codex_home/
+flow_paths.local.yaml
 
 # ============================================================
 # IDE & Editor

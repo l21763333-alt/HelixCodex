@@ -6,7 +6,8 @@ lark_notify.py — 飞书通知 + 人审交互 (直接 HTTP API, 零外部依赖
   接收:  wait_for_new_message / feishu_review
   解析:  parse_feishu_command → keep | reverse | rollback | stop | status | supplement
 
-凭据从 flow_config.yaml 读取。支持环境变量 FEISHU_APP_SECRET。
+凭据只从环境变量读取：FEISHU_APP_ID、FEISHU_APP_SECRET、
+FEISHU_CHAT_ID、FEISHU_VERIFICATION_TOKEN。
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+from typing import Any
 
-from config import get_config
+from config import get_config, get_paths
 
 # ── API 端点 ────────────────────────────────────────────
 FS_BASE        = "https://open.feishu.cn/open-apis"
@@ -26,10 +28,30 @@ FS_TOKEN_URL   = f"{FS_BASE}/auth/v3/tenant_access_token/internal"
 FS_SEND_URL    = f"{FS_BASE}/im/v1/messages"
 FS_MSG_CONTENT = f"{FS_BASE}/im/v1/messages/{{message_id}}"
 FS_MSG_LIST    = f"{FS_BASE}/im/v1/messages"
-CARD_ACTION_LOG = Path("runs") / "feishu_card_actions.jsonl"
+PROJECT_ROOT = Path(__file__).resolve().parent
+CARD_ACTION_LOG = get_paths().global_artifact("feishu_action_log")
 
 # ── Token 缓存 ──────────────────────────────────────────
 _token_cache: dict = {"token": "", "expires_at": 0.0}
+
+
+def normalize_supplement(value: Any) -> str | None:
+    """Return a plain supplement string; never leak command/raw dicts into loop state."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        for key in ("supplement", "text", "message", "raw"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+        return None
+    text = str(value).strip()
+    if not text or text in {"{}", "[]"}:
+        return None
+    return text
 
 
 def _get_tenant_token() -> str:
@@ -37,7 +59,7 @@ def _get_tenant_token() -> str:
         return _token_cache["token"]
     cfg = get_config().feishu
     if not cfg.app_id or not cfg.app_secret:
-        raise RuntimeError("feishu.app_id 或 app_secret 未配置")
+        raise RuntimeError("请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET 环境变量")
     body = json.dumps({"app_id": cfg.app_id, "app_secret": cfg.app_secret}).encode()
     req = urllib.request.Request(FS_TOKEN_URL, data=body,
         headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
@@ -180,6 +202,66 @@ def send_review_card(trial_output: str, chat_id: str | None = None) -> bool:
                                  Path(trial_output).name, chat_id)
 
 
+def build_recovery_card(trial_id: str, phase: str, error: str) -> dict:
+    """Build the manual recovery card for interrupted workflow stages."""
+    content = "\n".join([
+        f"**Stage interrupted:** `{phase}`",
+        "",
+        f"**Trial:** `{trial_id}`",
+        "",
+        "**Error**",
+        f"```text\n{str(error)[:1200]}\n```",
+        "",
+        "Choose a recovery action, or reply with `/resume`, `/retry-stage <phase>`, `/skip-stage <phase>`, `/status`, `/stop`.",
+    ])
+    actions = [
+        ("Resume", "/resume", "primary"),
+        ("Retry Stage", f"/retry-stage {phase}", "default"),
+        ("Skip Stage", f"/skip-stage {phase}", "default"),
+        ("Stop", "/stop", "danger"),
+    ]
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "red",
+            "title": {"tag": "plain_text", "content": f"Codex Flow recovery: {trial_id}"},
+        },
+        "elements": [
+            {"tag": "markdown", "content": content},
+            {"tag": "action", "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": button_type,
+                    "value": {
+                        "command": command,
+                        "trial_id": trial_id,
+                        "phase": phase,
+                    },
+                }
+                for label, command, button_type in actions
+            ]},
+        ],
+    }
+
+
+def notify_stage_interrupted(trial_id: str, phase: str, error: str,
+                             chat_id: str | None = None) -> bool:
+    """Notify Feishu that a workflow stage needs manual recovery."""
+    card = build_recovery_card(trial_id, phase, error)
+    ok = send_interactive_card(card, chat_id)
+    if ok:
+        return True
+    return send_markdown(
+        f"**Codex Flow stage interrupted**\n\n"
+        f"- Trial: `{trial_id}`\n"
+        f"- Phase: `{phase}`\n\n"
+        f"```text\n{str(error)[:1200]}\n```\n\n"
+        "Reply with `/resume`, `/retry-stage <phase>`, `/skip-stage <phase>`, `/status`, or `/stop`.",
+        chat_id,
+    )
+
+
 def build_trial_review_text(trial_id: str, comparison: dict,
                             auto_suggestion: str = "keep") -> str:
     """Build a compact review-card markdown from metric comparison."""
@@ -306,13 +388,14 @@ def wait_for_review_event(chat_id: str, trial_id: str, timeout: int = 600,
     """等待文本回复或卡片回调。只处理本函数调用之后到达的消息。"""
     if not chat_id:
         return None
-    marker_ms = int(time.time() * 1000)  # 时间戳基线
+    marker_s = time.time()
+    marker_ms = int(marker_s * 1000)  # 时间戳基线
     deadline = float("inf") if timeout <= 0 else time.time() + timeout
     seen_card_keys: set[tuple] = set()
 
     while time.time() < deadline:
         # 检查卡片回调
-        for action in _read_card_actions(time.time(), trial_id):
+        for action in _read_card_actions(marker_s, trial_id):
             key = (action.get("received_at"), action.get("trial_id"),
                    action.get("action"), action.get("supplement"))
             if key in seen_card_keys:
@@ -332,6 +415,29 @@ def wait_for_review_event(chat_id: str, trial_id: str, timeout: int = 600,
     return None
 
 
+def wait_for_recovery_event(chat_id: str, trial_id: str, phase: str,
+                            timeout: int = 0,
+                            poll_interval: int = 5,
+                            sender_filter: list[str] | None = None) -> dict | None:
+    """Wait for a recovery command from text or card callbacks."""
+    event = wait_for_review_event(
+        chat_id=chat_id,
+        trial_id=trial_id,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        sender_filter=sender_filter,
+    )
+    if event is None:
+        return None
+    if event.get("source") == "card":
+        cmd = event.get("command", {})
+    else:
+        cmd = parse_feishu_command(event.get("message", {}).get("text", ""))
+    cmd.setdefault("phase", phase)
+    cmd.setdefault("trial_id", trial_id)
+    return cmd
+
+
 def human_review_enabled() -> bool:
     cfg = get_config()
     return cfg.feishu.enabled and cfg.loop.human_review.enabled
@@ -344,11 +450,15 @@ def human_review_enabled() -> bool:
 _RE_KEEP     = re.compile(r'^\s*/?(keep|保留|继续|接受|ok|yes)\s*$', re.I)
 _RE_REVERSE  = re.compile(r'^\s*/?(reverse|反向|回溯|回退|放弃|撤销|undo)\s*$', re.I)
 _RE_ROLLBACK = re.compile(r'^\s*/?(rollback|重跑|重试|重来|retry|redo)\s*$', re.I)
+_RE_REVISE_EMPTY = re.compile(r'^\s*/?(revise|修改|调整)\s*$', re.I)
 _RE_REVISE   = re.compile(r'^\s*/?(revise|修改|调整)\s+(.+)$', re.I)
 _RE_BRANCH   = re.compile(r'^\s*/?(branch|分支)\s+(.+)$', re.I)
 _RE_STOP     = re.compile(r'^\s*/?(stop|停止|结束|终止|退出|exit|quit)\s*$', re.I)
 _RE_STATUS   = re.compile(r'^\s*/?(status|状态|进度|汇总)\s*$', re.I)
 # "命令 + 补充文本": keep, 试试Tweedie / rollback 换seed / reverse 方向不对 / revise 关注异常
+_RE_RESUME   = re.compile(r'^\s*/?(resume|continue)\s*$', re.I)
+_RE_RETRY_STAGE = re.compile(r'^\s*/?(retry-stage|retry_stage|retry)\s+([A-Za-z0-9_-]+)\s*$', re.I)
+_RE_SKIP_STAGE = re.compile(r'^\s*/?(skip-stage|skip_stage|skip)\s+([A-Za-z0-9_-]+)\s*$', re.I)
 _RE_CMD_SUPP = re.compile(
     r'^\s*/?(keep|保留|继续|reverse|反向|回溯|rollback|重跑|重试|revise|修改|调整|branch|分支|stop|停止)'
     r'[\s,，。.]+(.+)$', re.I)
@@ -360,12 +470,26 @@ def parse_feishu_command(text: str) -> dict:
     if not text:
         return {"raw": text, "action": "supplement", "supplement": None}
 
+    if _RE_RESUME.match(text):
+        return {"raw": text, "action": "resume", "phase": None, "supplement": None}
+
+    m = _RE_RETRY_STAGE.match(text)
+    if m:
+        return {"raw": text, "action": "retry-stage", "phase": m.group(2), "supplement": None}
+
+    m = _RE_SKIP_STAGE.match(text)
+    if m:
+        return {"raw": text, "action": "skip-stage", "phase": m.group(2), "supplement": None}
+
     # 1. 精确命令
     for regex, action in [(_RE_KEEP, "keep"), (_RE_REVERSE, "reverse"),
                           (_RE_ROLLBACK, "rollback"), (_RE_STOP, "stop"),
                           (_RE_STATUS, "status")]:
         if regex.match(text):
             return {"raw": text, "action": action, "supplement": None}
+
+    if _RE_REVISE_EMPTY.match(text):
+        return {"raw": text, "action": "rollback", "supplement": None}
 
     # 2. "/revise <建议>" → rollback + 建议注入 Ask
     m = _RE_REVISE.match(text)
@@ -411,6 +535,8 @@ def parse_feishu_card_action(payload: dict) -> dict:
     parsed = parse_feishu_command(text)
     if isinstance(value, dict):
         parsed["trial_id"] = value.get("trial_id", "")
+        if value.get("phase"):
+            parsed["phase"] = value.get("phase")
     parsed["card_action"] = True
     return parsed
 
@@ -509,8 +635,69 @@ def notify_command_result(decision: str, supplement: str | None,
             "rollback": "🔄 重跑本轮",
             "stop": "🛑 停止实验"}.get(decision, f"❓ {decision}")
     lines = [f"**收到指令: {name}**", f"▶ 下一轮: Round {next_round}"]
-    if supplement:
-        lines.append(f"📝 补充已注入: \"{supplement[:200]}\"")
+    supp = normalize_supplement(supplement)
+    if supp:
+        lines.append(f"📝 补充已注入: \"{supp[:200]}\"")
+    return send_markdown("\n".join(lines))
+
+
+def notify_git_sync_result(result: dict[str, Any]) -> bool:
+    """Notify loop-start remote baseline synchronization status."""
+    sync = result.get("sync", result)
+    state = result.get("state", sync.get("state", {})) if isinstance(sync, dict) else {}
+    ok = bool(result.get("ok", sync.get("synced", False) if isinstance(sync, dict) else False))
+    icon = "OK" if ok else "WARN"
+    lines = [
+        f"**Git baseline sync: {icon}**",
+        f"- remote: `{sync.get('remote', '')}`" if isinstance(sync, dict) else "- remote: unknown",
+        f"- base: `{sync.get('base_branch', '')}`" if isinstance(sync, dict) else "- base: unknown",
+        f"- remote HEAD: `{sync.get('remote_head', '')}`" if isinstance(sync, dict) else "",
+        f"- local HEAD: `{sync.get('local_head_after') or sync.get('local_head') or state.get('head', '')}`",
+        f"- branch: `{state.get('branch') or sync.get('branch_after', '')}`",
+    ]
+    if isinstance(sync, dict) and sync.get("blocked"):
+        lines.append(f"- blocked: `{sync.get('reason', 'unknown')}`")
+        changes = sync.get("model_changes") or []
+        if changes:
+            lines.append("- model changes: `" + "`, `".join(map(str, changes[:8])) + "`")
+    error = result.get("error")
+    if error:
+        lines.append(f"- error: `{str(error)[:500]}`")
+    return send_markdown("\n".join(line for line in lines if line))
+
+
+def notify_git_publish_result(result: dict[str, Any], next_baseline: str | None = None) -> bool:
+    """Notify KEEP Git commit/push/PR publication result."""
+    publish = result.get("publish", result)
+    commit = publish.get("commit", {}) if isinstance(publish, dict) else {}
+    push = publish.get("push", {}) if isinstance(publish, dict) else {}
+    pr = publish.get("pr", {}) if isinstance(publish, dict) else {}
+    ok = bool(result.get("ok", True)) and not result.get("error")
+    icon = "OK" if ok else "WARN"
+    lines = [f"**KEEP model Git publish: {icon}**"]
+    if isinstance(publish, dict):
+        lines.append(f"- branch: `{publish.get('branch', '')}`")
+    if commit:
+        lines.append(f"- committed: `{commit.get('committed')}`")
+        if commit.get("commit"):
+            lines.append(f"- commit: `{commit.get('commit')}`")
+    if push:
+        lines.append(
+            f"- pushed: `{push.get('pushed')}` to "
+            f"`{push.get('remote')}/{push.get('target_branch') or push.get('branch')}`"
+        )
+    elif isinstance(publish, dict):
+        lines.append("- pushed: `false`")
+    if pr:
+        if pr.get("url"):
+            lines.append(f"- PR: {pr.get('url')}")
+        elif pr.get("draft_path"):
+            lines.append(f"- PR draft: `{pr.get('draft_path')}`")
+    if next_baseline:
+        lines.append(f"- next baseline: `{next_baseline}`")
+    error = result.get("error")
+    if error:
+        lines.append(f"- error: `{str(error)[:700]}`")
     return send_markdown("\n".join(lines))
 
 
@@ -600,4 +787,4 @@ def feishu_review(trial_id: str, ask: str, comparison: dict,
         return (decision, supp)
 
     decision = cmd["action"] if cmd["action"] != "supplement" else auto_suggestion
-    return (decision, cmd["supplement"] or cmd["raw"])
+    return (decision, normalize_supplement(cmd.get("supplement")))

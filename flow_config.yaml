@@ -15,10 +15,11 @@ auth:
 
 feishu:
   enabled: true
-  app_id: "cli_aab265dad8bf9cb3"
-  app_secret: ""
-  chat_id: "oc_f68aa0f27b4e5aa077b962a510f8ae4f"
-  verification_token: ""
+  # Credentials and identifiers are read only from environment variables:
+  #   FEISHU_APP_ID
+  #   FEISHU_APP_SECRET
+  #   FEISHU_CHAT_ID
+  #   FEISHU_VERIFICATION_TOKEN
   poll_interval: 5
 
 loop:
@@ -36,6 +37,22 @@ loop:
   convergence:
     min_wape_improvement: 0.0005
     max_rounds_without_improvement: 2
+
+recovery:
+  enabled: true
+  codex_max_attempts: 2
+  retry_delay_seconds: 30
+  manual_after_attempts: true
+  manual_timeout: 0
+  recoverable_codex_phases:
+    - "evaluate"
+    - "plan"
+    - "codegen"
+    - "report"
+    - "feishu_card"
+  degradable_phases:
+    - "report"
+    - "feishu_card"
 
 paths:
   experiment_dir: "baseline"
@@ -55,10 +72,22 @@ mcp:
     allowed_paths:
       - "baseline/src/**"
       - "baseline/requirements.txt"
-    trial_code_subdir: "agent2/code"
+    trial_code_subdir: "candidate/code"
     branch_prefix: "model-exp/"
-    remote: "origin"
-    base_branch: "main"
+    remote: "forecastops"
+    base_branch: "ForecastModel"
+    sync_on_loop_start: true
+    sync_before_each_trial: false
+    publish_via_subagent: true
+    push_on_keep: true
+    create_pr_on_keep: false
+    pr_draft: true
+    push_target_branch: "ForecastModel"
+    server_transport: "stdio"
+    server_command: "python"
+    server_args:
+      - "-m"
+      - "mcp_servers.git_research_server.server"
     require_human_approval_for_push: true
     allow_force_push: false
     allow_reset_hard: false
