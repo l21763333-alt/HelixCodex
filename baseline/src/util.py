@@ -422,11 +422,12 @@ def apply_recent_trend_guardrail(pred: np.ndarray, feature_df: pd.DataFrame, lab
         }])
 
     pred_arr = np.asarray(pred, dtype=float).copy()
-    lag_1 = pd.to_numeric(feature_df.get(f"{label_col}_lag_1", 0.0), errors="coerce").fillna(0.0).to_numpy()
-    lag_2 = pd.to_numeric(feature_df.get(f"{label_col}_lag_2", 0.0), errors="coerce").fillna(0.0).to_numpy()
-    lag_3 = pd.to_numeric(feature_df.get(f"{label_col}_lag_3", 0.0), errors="coerce").fillna(0.0).to_numpy()
-    rolling_3 = pd.to_numeric(feature_df.get(f"{label_col}_rolling_3_mean", 0.0), errors="coerce").fillna(0.0).to_numpy()
-    rolling_7 = pd.to_numeric(feature_df.get(f"{label_col}_rolling_7_mean", 0.0), errors="coerce").fillna(0.0).to_numpy()
+    zero_default = pd.Series(0.0, index=feature_df.index)
+    lag_1 = pd.to_numeric(feature_df.get(f"{label_col}_lag_1", zero_default), errors="coerce").fillna(0.0).to_numpy()
+    lag_2 = pd.to_numeric(feature_df.get(f"{label_col}_lag_2", zero_default), errors="coerce").fillna(0.0).to_numpy()
+    lag_3 = pd.to_numeric(feature_df.get(f"{label_col}_lag_3", zero_default), errors="coerce").fillna(0.0).to_numpy()
+    rolling_3 = pd.to_numeric(feature_df.get(f"{label_col}_rolling_3_mean", zero_default), errors="coerce").fillna(0.0).to_numpy()
+    rolling_7 = pd.to_numeric(feature_df.get(f"{label_col}_rolling_7_mean", zero_default), errors="coerce").fillna(0.0).to_numpy()
 
     recent_anchor = np.maximum(0.55 * lag_1 + 0.30 * lag_2 + 0.15 * lag_3, 0.70 * rolling_3)
     trend_ratio = recent_anchor / np.maximum(rolling_7, 1.0)

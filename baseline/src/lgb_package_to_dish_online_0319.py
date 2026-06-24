@@ -64,7 +64,7 @@ except ImportError:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="T+2 package forecast baseline experiments")
     parser.add_argument("--experiment", type=str, default="baseline", choices=["baseline", "exp_02_tweedie"])
     # parser.add_argument("--data_path", type=str, default=r"D:\hdl_data\ai_order_tc_forecast_0319_a.csv")
@@ -122,6 +122,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration_min_pred_sum", type=float, default=20.0)
     parser.add_argument("--calibration_clip_lower", type=float, default=0.70)
     parser.add_argument("--calibration_clip_upper", type=float, default=1.50)
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    parser = build_arg_parser()
     args = parser.parse_args()
     return apply_experiment_preset(args)
 
@@ -155,6 +160,9 @@ def apply_experiment_preset(args: argparse.Namespace) -> argparse.Namespace:
     args.enable_group_calibration = True
     args.backtest_output_prefix = "exp_02_tweedie_t2_availability_holiday_calibrated"
     return args
+
+
+parse_args.__wrapped__ = build_arg_parser()
 
 def load_holiday_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -341,13 +349,15 @@ def add_manual_public_holiday_features(df: pd.DataFrame, args: argparse.Namespac
     out_df = df.copy()
     target_date = pd.to_datetime(out_df[args.date_col], errors="coerce").dt.normalize()
 
-    is_holiday_source = pd.to_numeric(out_df.get("is_holiday", 0), errors="coerce").fillna(0).astype(int)
+    zero_default = pd.Series(0, index=out_df.index)
+    far_default = pd.Series(999, index=out_df.index)
+    is_holiday_source = pd.to_numeric(out_df.get("is_holiday", zero_default), errors="coerce").fillna(0).astype(int)
     out_df["is_public_holiday_manual"] = is_holiday_source.eq(1).astype(int)
-    out_df["holiday_name_code"] = pd.to_numeric(out_df.get("holiday_type", 0), errors="coerce").fillna(0).astype(int)
-    out_df["holiday_day_idx"] = pd.to_numeric(out_df.get("holiday_span_day_idx", 0), errors="coerce").fillna(0).astype(int)
-    out_df["manual_holiday_span_days"] = pd.to_numeric(out_df.get("holiday_span_days", 0), errors="coerce").fillna(0).astype(int)
-    out_df["days_to_public_holiday"] = pd.to_numeric(out_df.get("days_to_holiday", 999), errors="coerce").fillna(999).astype(int)
-    out_df["days_after_public_holiday"] = pd.to_numeric(out_df.get("days_after_holiday", 999), errors="coerce").fillna(999).astype(int)
+    out_df["holiday_name_code"] = pd.to_numeric(out_df.get("holiday_type", zero_default), errors="coerce").fillna(0).astype(int)
+    out_df["holiday_day_idx"] = pd.to_numeric(out_df.get("holiday_span_day_idx", zero_default), errors="coerce").fillna(0).astype(int)
+    out_df["manual_holiday_span_days"] = pd.to_numeric(out_df.get("holiday_span_days", zero_default), errors="coerce").fillna(0).astype(int)
+    out_df["days_to_public_holiday"] = pd.to_numeric(out_df.get("days_to_holiday", far_default), errors="coerce").fillna(999).astype(int)
+    out_df["days_after_public_holiday"] = pd.to_numeric(out_df.get("days_after_holiday", far_default), errors="coerce").fillna(999).astype(int)
     out_df["is_holiday_eve_1"] = out_df["days_to_public_holiday"].eq(1).astype(int)
     out_df["is_holiday_eve_2"] = out_df["days_to_public_holiday"].eq(2).astype(int)
     out_df["is_pre_public_holiday_3d"] = out_df["days_to_public_holiday"].between(1, 3).astype(int)
@@ -886,14 +896,15 @@ def package_bias_rate(series_df: pd.DataFrame, true_col: str, pred_col: str) -> 
 
 def build_calibration_context(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     context_df = pd.DataFrame(index=df.index)
+    zero_default = pd.Series(0, index=df.index)
     if "day_of_week" in df.columns:
         context_df["day_of_week"] = pd.to_numeric(df["day_of_week"], errors="coerce").fillna(0).astype(int)
     else:
         context_df["day_of_week"] = pd.to_datetime(df[args.date_col], errors="coerce").dt.weekday.fillna(-1).astype(int) + 1
-    context_df["peak_date_attribute"] = pd.to_numeric(df.get("peak_date_attribute", 0), errors="coerce").fillna(0).astype(int)
-    age = pd.to_numeric(df.get("package_age_days", 0), errors="coerce").fillna(0)
+    context_df["peak_date_attribute"] = pd.to_numeric(df.get("peak_date_attribute", zero_default), errors="coerce").fillna(0).astype(int)
+    age = pd.to_numeric(df.get("package_age_days", zero_default), errors="coerce").fillna(0)
     context_df["package_age_bucket"] = pd.cut(age, bins=[-1, 7, 14, 30, 999999], labels=[0, 1, 2, 3]).astype(int)
-    context_df["is_top_package_heat_14d"] = pd.to_numeric(df.get("is_top_package_heat_14d", 0), errors="coerce").fillna(0).astype(int)
+    context_df["is_top_package_heat_14d"] = pd.to_numeric(df.get("is_top_package_heat_14d", zero_default), errors="coerce").fillna(0).astype(int)
     return context_df
 
 
@@ -1238,10 +1249,20 @@ def allocate_dish_prediction_by_target_date(
     safe_horizon_days = max(int(horizon_days), 1)
     rows_df = rows_df.copy()
     package_pred_df = package_pred_df.copy()
-    history_rows_df = history_rows_df.copy()
     rows_df[args.date_col] = pd.to_datetime(rows_df[args.date_col], errors="coerce").dt.normalize()
     package_pred_df[args.date_col] = pd.to_datetime(package_pred_df[args.date_col], errors="coerce").dt.normalize()
-    history_rows_df[args.date_col] = pd.to_datetime(history_rows_df[args.date_col], errors="coerce").dt.normalize()
+
+    ratio_history_cols = list(
+        dict.fromkeys(ROW_ID_COLS + [args.date_col, args.dish_label_col, args.package_label_col])
+    )
+    missing_ratio_cols = [col for col in ratio_history_cols if col not in history_rows_df.columns]
+    if missing_ratio_cols:
+        raise ValueError(f"Missing columns for dish allocation ratio history: {missing_ratio_cols}")
+    ratio_history_base_df = history_rows_df.loc[:, ratio_history_cols].copy()
+    ratio_history_base_df[args.date_col] = pd.to_datetime(
+        ratio_history_base_df[args.date_col],
+        errors="coerce",
+    ).dt.normalize()
 
     all_alloc_df = []
     target_dates = rows_df[args.date_col].dropna().drop_duplicates().sort_values()
@@ -1249,8 +1270,7 @@ def allocate_dish_prediction_by_target_date(
         ratio_cutoff_date = target_date - pd.Timedelta(days=safe_horizon_days - 1)
         target_rows_df = rows_df[rows_df[args.date_col].eq(target_date)].copy()
         target_package_pred_df = package_pred_df[package_pred_df[args.date_col].eq(target_date)].copy()
-        ratio_history_rows_df = history_rows_df[history_rows_df[args.date_col] < ratio_cutoff_date].copy()
-        ratio_bundle = build_ratio_bundle(ratio_history_rows_df, ratio_cutoff_date, args)
+        ratio_bundle = build_ratio_bundle(ratio_history_base_df, ratio_cutoff_date, args)
         all_alloc_df.append(allocate_dish_prediction(target_rows_df, target_package_pred_df, ratio_bundle, args))
 
     if not all_alloc_df:
