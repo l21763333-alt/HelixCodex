@@ -46,7 +46,7 @@ from openai_codex.generated.v2_all import (
     GetAccountRateLimitsResponse,
     CodexErrorInfoValue,
 )
-from config import build_codex_config, get_config, get_paths
+from config import PROJECT_ROOT, build_codex_config, get_config, get_paths
 
 # ============================================================
 # 固定路径 — skills 目录 & 确定性执行脚本
@@ -56,6 +56,18 @@ SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 
 # T3 确定性执行依赖的脚本 (skill scripts, 固定路径)
 EVAL_CALCULATE_SCRIPT = SKILLS_ROOT / "forecast-evaluation-analyzer" / "scripts" / "calculate_metrics.py"
+MAX_T3_PREDICTION_BYTES = 1_000_000_000
+T3_TRAIN_TIMEOUT_SECONDS = 3600
+T3_METRIC_TIMEOUT_SECONDS = 300
+
+
+class PredictionContractError(ValueError):
+    """Raised when codegen produced an output that T3 should not evaluate."""
+
+
+class HistoryEvalContractError(ValueError):
+    """Raised when codegen violates the bounded --history_eval_only runtime path."""
+
 
 # Codex 会话配置
 # CODEX_HOME 固定: 确保 app-server 每次都从同一个目录读写 session 状态
@@ -479,6 +491,12 @@ feature_changes:
   - action: ...
 ```
 
+Runtime contract additions:
+- train_command must finish on the full --data_path within the T3 timeout.
+- --history_eval_only must be a bounded evaluation path, not an expensive full-table research training job.
+- package_detail output must contain split,true_pos_cnt,pred_pos_cnt for test rows.
+- Do not write the raw feature table as package_detail; output only metric contract columns needed by T3.
+
 硬约束:
 - 只在 {trial_code_dir}/ 下修改, 不访问 {experiment_dir}
 - 禁止在 {trial_code_dir}/ 下创建 data/、outputs/、logs/、__pycache__/；数据必须通过 --data_path={data_path} 读取
@@ -701,6 +719,28 @@ def _rel_to_trial(output_dir: str | Path, path: str | Path) -> str:
         return target.relative_to(root).as_posix()
     except ValueError:
         return target.as_posix()
+
+
+def _configured_git_model_baseline_dir() -> Path | None:
+    """Return the Git MCP worktree baseline directory when it should seed trial code."""
+    cfg = get_config().mcp.git
+    if not cfg.enabled or cfg.scope != "baseline_model":
+        return None
+
+    repo = Path(cfg.repo_path)
+    if not repo.is_absolute():
+        repo = PROJECT_ROOT / repo
+    baseline = Path(cfg.baseline_dir)
+    source = baseline if baseline.is_absolute() else repo / baseline
+    source = source.resolve()
+    if (source / "src").exists() or (source / "requirements.txt").exists():
+        return source
+    return None
+
+
+def _initial_code_source_dir(experiment_dir: str | Path) -> Path:
+    """Prefer the synced Git MCP model worktree for source code, fallback to experiment_dir."""
+    return _configured_git_model_baseline_dir() or Path(experiment_dir).resolve()
 
 
 def copy_source_to_trial(experiment_dir: str, output_dir: str) -> list[str]:
@@ -984,6 +1024,10 @@ def run_codex_thread(
     ask: str,
     trial_id: str,
     data_dir: str = "",
+    data_path: str = "",
+    trial_code_dir: str = "",
+    legacy_trial_code_dir: str = "",
+    trial_outputs_dir: str = "",
     max_attempts: int = 2,
     retry_delay_s: float = 15.0,
 ) -> str:
@@ -994,6 +1038,10 @@ def run_codex_thread(
         ask=ask,
         trial_id=trial_id,
         data_dir=data_dir,
+        data_path=data_path,
+        trial_code_dir=trial_code_dir,
+        legacy_trial_code_dir=legacy_trial_code_dir,
+        trial_outputs_dir=trial_outputs_dir,
     )
     inputs: list = [TextInput(text=prompt)] + _resolve_skill_inputs(spec.skills)
 
@@ -1070,6 +1118,222 @@ def run_codex_thread(
 # ============================================================
 # T3: 指标计算工具
 # ============================================================
+
+def _read_csv_header(csv_path: Path) -> list[str]:
+    import csv
+
+    with csv_path.open("r", newline="", encoding="utf-8-sig", errors="replace") as handle:
+        try:
+            return next(csv.reader(handle))
+        except StopIteration:
+            return []
+
+
+def _validate_t3_prediction_contract(csv_path: Path) -> None:
+    """Reject obviously invalid codegen outputs before expensive metric reads."""
+    if not csv_path.exists():
+        raise PredictionContractError(f"prediction file does not exist: {csv_path}")
+
+    size = csv_path.stat().st_size
+    if size > MAX_T3_PREDICTION_BYTES:
+        raise PredictionContractError(
+            f"prediction file is too large for T3 evaluation: {size} bytes "
+            f"(limit={MAX_T3_PREDICTION_BYTES}); likely wrote the raw feature table"
+        )
+
+    columns = set(_read_csv_header(csv_path))
+    if not columns:
+        raise PredictionContractError(f"prediction file has no header: {csv_path}")
+    if "split" not in columns:
+        raise PredictionContractError(
+            f"prediction output missing required split column; columns={sorted(columns)}"
+        )
+
+    name = csv_path.name.lower()
+    package_detail_schemas = (
+        {"true_pos_cnt", "pred_pos_cnt"},
+        {"true_pos_cnt", "error_pos_cnt", "abs_error_pos_cnt"},
+    )
+    store_dish_day_schemas = (
+        {"true_real_qty_sum", "pred_real_qty_sum"},
+        {"true_real_qty_sum", "error", "abs_error"},
+    )
+    generic_schemas = (
+        {"actual", "prediction"},
+        {"y_true", "y_pred"},
+    )
+
+    if "package_detail" in name:
+        accepted = package_detail_schemas
+        expected = "split plus true_pos_cnt/pred_pos_cnt (or precomputed package_detail error columns)"
+    elif "store_dish_day" in name:
+        accepted = store_dish_day_schemas
+        expected = "split plus true_real_qty_sum/pred_real_qty_sum (or precomputed store_dish_day error columns)"
+    else:
+        accepted = package_detail_schemas + store_dish_day_schemas + generic_schemas
+        expected = "one T3 metric schema"
+
+    if not any(schema.issubset(columns) for schema in accepted):
+        raise PredictionContractError(
+            f"prediction output does not match {expected}; columns={sorted(columns)}"
+        )
+
+
+def _train_cmd_uses_history_eval_only(train_cmd: list[str]) -> bool:
+    return any(str(part) in {"--history_eval_only", "--history-eval-only"} for part in train_cmd)
+
+
+def _extract_top_level_function_source(source: str, function_name: str) -> list[str]:
+    lines = source.splitlines()
+    start_idx: int | None = None
+    for idx, line in enumerate(lines):
+        if line.startswith(f"def {function_name}("):
+            start_idx = idx
+            break
+    if start_idx is None:
+        return lines
+
+    end_idx = len(lines)
+    for idx in range(start_idx + 1, len(lines)):
+        line = lines[idx]
+        if line.startswith("def ") or line.startswith("class "):
+            end_idx = idx
+            break
+    return lines[start_idx:end_idx]
+
+
+def _source_files_for_history_eval_check(code_dir: Path, exec_plan: dict[str, Any]) -> list[Path]:
+    candidates: list[Path] = []
+    source_entrypoint = exec_plan.get("source_entrypoint")
+    if source_entrypoint:
+        candidates.append(code_dir / str(source_entrypoint))
+    candidates.extend([
+        code_dir / "src" / "lgb_package_to_dish_online_0319.py",
+        code_dir / "train.py",
+    ])
+
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.exists():
+            existing.append(candidate)
+    return existing
+
+
+def _validate_history_eval_bounded_path(code_dir: Path, exec_plan: dict[str, Any], train_cmd: list[str]) -> None:
+    """Reject candidate code that would run full dish allocation in --history_eval_only.
+
+    This is intentionally a conservative preflight check. It only activates for
+    train commands that include --history_eval_only, and it scans the generated
+    model entrypoint for the expected bounded early-return before expensive
+    allocation / store-dish output calls.
+    """
+    if not _train_cmd_uses_history_eval_only(train_cmd):
+        return
+
+    source_files = _source_files_for_history_eval_check(code_dir, exec_plan)
+    if not source_files:
+        raise HistoryEvalContractError(
+            "cannot find generated train.py or source_entrypoint to verify bounded history_eval_only path"
+        )
+
+    dangerous_tokens = (
+        "allocate_dish_prediction_by_target_date(",
+        "build_store_dish_day_output(",
+        "store_dish_day_df.to_csv(",
+        "_store_dish_day.csv",
+    )
+    guard_tokens = (
+        "if args.history_eval_only",
+        "if getattr(args, \"history_eval_only\"",
+        "if getattr(args, 'history_eval_only'",
+    )
+
+    checked_any_danger = False
+    for source_path in source_files:
+        source = source_path.read_text(encoding="utf-8", errors="replace")
+        lines = _extract_top_level_function_source(source, "run_t2_package_backtest")
+
+        dangerous_lines: list[int] = []
+        guard_lines: list[int] = []
+        for idx, raw_line in enumerate(lines):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("def "):
+                continue
+            if any(token in stripped for token in guard_tokens):
+                guard_lines.append(idx)
+            if any(token in stripped for token in dangerous_tokens):
+                dangerous_lines.append(idx)
+
+        if not dangerous_lines:
+            continue
+        checked_any_danger = True
+        first_danger = min(dangerous_lines)
+        valid_guard = False
+        for guard in guard_lines:
+            if guard >= first_danger:
+                continue
+            guarded_block = lines[guard:first_danger]
+            if any("return" in line.strip().split("#", 1)[0] for line in guarded_block):
+                valid_guard = True
+                break
+        if not valid_guard:
+            source_rel = source_path.relative_to(code_dir) if source_path.is_relative_to(code_dir) else source_path
+            raise HistoryEvalContractError(
+                f"{source_rel} calls expensive dish allocation/store_dish output before a bounded "
+                "--history_eval_only early return; add an if args.history_eval_only block that writes "
+                "test package_detail contract columns and returns before allocation"
+            )
+
+    if checked_any_danger:
+        return
+
+
+def _append_train_log_section(train_log: Path, title: str, body: str) -> None:
+    existing = train_log.read_text(encoding="utf-8") if train_log.exists() else ""
+    train_log.write_text(
+        f"{existing.rstrip()}\n\n=== {title} ===\n{body.rstrip()}\n",
+        encoding="utf-8",
+    )
+
+
+def _timeout_output_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _classify_eval_failure(eval_error: str | None) -> str | None:
+    if not eval_error:
+        return None
+    if eval_error.startswith("history_eval_only contract invalid"):
+        return "history_eval_contract_error"
+    if eval_error.startswith("training command timed out"):
+        return "train_timeout"
+    if eval_error.startswith("training failed"):
+        return "train_error"
+    if eval_error.startswith("prediction contract invalid"):
+        return "output_contract_error"
+    if "timed out" in eval_error:
+        return "metric_timeout"
+    if eval_error.startswith("prediction file missing"):
+        return "missing_prediction"
+    if eval_error.startswith("calculate_metrics.py failed"):
+        return "metric_error"
+    return "eval_error"
+
+
+def _needs_codegen_retry(comparison: dict | None) -> bool:
+    if not comparison:
+        return True
+    return comparison.get("primary", {}).get("new_wape", 999) == 999
+
 
 def _compute_wape_bias_from_csv(csv_path: Path, split_filter: str = "test") -> tuple[float, float, int]:
     """从带 split 列的 prediction CSV 计算指定 split 的 WAPE 和 Bias.
@@ -1308,17 +1572,50 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     # ── 2. 执行训练 ──
     print(f"\n[T3] 执行训练: {' '.join(train_cmd)}")
     _stage_log(str(output), "execute", f"training command: {' '.join(train_cmd)}")
-    train_result = subprocess.run(
-        train_cmd,
-        cwd=str(code_dir),
-        capture_output=True, text=True,
-        timeout=3600,
-    )
-
     train_log = get_paths().trial_logs_dir(output) / "train.log"
-    train_log.write_text(
-        f"STDOUT:\n{train_result.stdout}\n\nSTDERR:\n{train_result.stderr}",
-        encoding="utf-8",
+    train_error: str | None = None
+    try:
+        _validate_history_eval_bounded_path(code_dir, exec_plan, train_cmd)
+    except HistoryEvalContractError as e:
+        train_error = f"history_eval_only contract invalid: {e}"
+        print(f"[T3] history_eval_only contract invalid: {e}")
+        _stage_log(str(output), "execute", train_error)
+        train_result = subprocess.CompletedProcess(
+            args=train_cmd,
+            returncode=125,
+            stdout="",
+            stderr=train_error,
+        )
+    else:
+        try:
+            train_result = subprocess.run(
+                train_cmd,
+                cwd=str(code_dir),
+                capture_output=True, text=True,
+                timeout=T3_TRAIN_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as e:
+            stdout = _timeout_output_to_text(e.stdout)
+            stderr = _timeout_output_to_text(e.stderr)
+            train_error = f"training command timed out after {e.timeout} seconds"
+            print(f"[T3] training timeout: {train_error}")
+            _stage_log(str(output), "execute", train_error)
+            train_result = subprocess.CompletedProcess(
+                args=train_cmd,
+                returncode=124,
+                stdout=stdout,
+                stderr=(stderr.rstrip() + f"\n{train_error}").strip(),
+            )
+
+    _append_train_log_section(
+        train_log,
+        "T3 TRAIN RUN",
+        (
+            f"CMD: {' '.join(train_cmd)}\n"
+            f"RC: {train_result.returncode}\n\n"
+            f"STDOUT:\n{train_result.stdout}\n\n"
+            f"STDERR:\n{train_result.stderr}"
+        ),
     )
 
     train_success = train_result.returncode == 0
@@ -1334,9 +1631,11 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     actual_path = get_paths().trial_standardized_dir(output) / "standardized_actual.csv"
 
     eval_success = False
+    eval_error: str | None = None
     new_wape, new_bias, new_rows = 999.0, 0.0, 0  # 默认值: 训练失败时使用
     if train_success and prediction_path.exists():
         try:
+            _validate_t3_prediction_contract(prediction_path)
             new_wape, new_bias, new_rows = _compute_wape_bias_from_csv(prediction_path, "test")
             eval_success = True
             print(f"[T3] new test: WAPE={new_wape:.4f}, Bias={new_bias:+.4f}, rows={new_rows}")
@@ -1344,17 +1643,29 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
             (output / "evaluation" / "new_metrics.json").write_text(
                 json.dumps({"wape": new_wape, "bias": new_bias, "rows": new_rows}, indent=2, ensure_ascii=False),
                 encoding="utf-8")
+        except PredictionContractError as e:
+            eval_error = f"prediction contract invalid: {e}"
+            print(f"[T3] prediction contract invalid: {e}")
+            _stage_log(str(output), "execute", eval_error)
         except Exception as e:
             print(f"[T3] test-split 读取失败 ({e}), 回退 calculate_metrics.py")
             new_metrics_csv = output / "evaluation" / "new_metrics_summary.csv"
-            eval_result = subprocess.run(
-                [sys.executable, str(EVAL_CALCULATE_SCRIPT),
-                 "--prediction", str(prediction_path),
-                 "--actual", str(actual_path),
-                 "--output", str(new_metrics_csv)],
-                capture_output=True, text=True, timeout=300,
-            )
-            eval_success = eval_result.returncode == 0
+            try:
+                eval_result = subprocess.run(
+                    [sys.executable, str(EVAL_CALCULATE_SCRIPT),
+                     "--prediction", str(prediction_path),
+                     "--actual", str(actual_path),
+                     "--output", str(new_metrics_csv)],
+                    capture_output=True, text=True, timeout=T3_METRIC_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as e:
+                eval_error = f"calculate_metrics.py timed out after {e.timeout} seconds"
+                print(f"[T3] evaluation timeout: {eval_error}")
+                _stage_log(str(output), "execute", eval_error)
+                eval_result = subprocess.CompletedProcess(args=[], returncode=124, stdout="", stderr=eval_error)
+            eval_success = bool(eval_result and eval_result.returncode == 0)
+            if not eval_success and eval_result is not None and eval_error is None:
+                eval_error = f"calculate_metrics.py failed rc={eval_result.returncode}: {eval_result.stderr[:500]}"
             if eval_success:
                 try:
                     new_metrics = json.loads(eval_result.stdout)
@@ -1373,6 +1684,56 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
             str(output),
             "execute",
             f"skip evaluation train_success={train_success} prediction_exists={prediction_path.exists()}",
+        )
+
+    if not train_success:
+        if train_error:
+            eval_error = train_error
+        else:
+            stderr_tail = (train_result.stderr or train_result.stdout or "").strip()[-500:]
+            eval_error = f"training failed rc={train_result.returncode}: {stderr_tail}"
+
+    if train_success and not prediction_path.exists():
+        eval_error = f"prediction file missing after successful training: {prediction_path}"
+
+    failure_type = _classify_eval_failure(eval_error)
+    if eval_error:
+        if failure_type == "history_eval_contract_error":
+            failure_section = "T3 PREFLIGHT CONTRACT ERROR"
+        elif failure_type in {"train_timeout", "train_error"}:
+            failure_section = "T3 TRAINING ERROR"
+        else:
+            failure_section = "T3 EVALUATION ERROR"
+        _append_train_log_section(
+            train_log,
+            failure_section,
+            (
+                f"{eval_error}\n"
+                f"Prediction path: {prediction_path}\n"
+                "Codegen must repair the candidate code before retry.\n"
+                "When --history_eval_only is present, write the test split package_detail "
+                "contract and return before dish allocation / store_dish aggregation.\n"
+                "Do not call allocate_dish_prediction_by_target_date or write "
+                "store_dish_day in history_eval_only.\n"
+                "If this is a train_timeout, do not extend the timeout; implement a bounded "
+                "--history_eval_only path that finishes quickly on the full data reference.\n"
+                "For package_detail output, write split plus true_pos_cnt/pred_pos_cnt "
+                "(or true_pos_cnt/error_pos_cnt/abs_error_pos_cnt), not the raw feature table."
+            ),
+        )
+        (output / "evaluation" / "new_metrics.json").write_text(
+            json.dumps(
+                {
+                    "wape": new_wape,
+                    "bias": new_bias,
+                    "rows": new_rows,
+                    "error": eval_error,
+                    "failure_type": failure_type,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
 
     # ── 4. 读取 baseline 旧指标 (test 集, 直接从 outputs/ 原始文件) ──
@@ -1447,6 +1808,8 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
                    f"train_ok={train_success}, eval_ok={eval_success}"),
         "wape_delta": wape_delta,
         "bias_delta": bias_delta,
+        "eval_error": eval_error,
+        "failure_type": failure_type,
         "primary": {
             "level": "package_detail",
             "old_wape": old_wape, "new_wape": new_wape,
@@ -1467,6 +1830,8 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     run_status = {
         "train_success": train_success,
         "eval_success": eval_success,
+        "eval_error": eval_error,
+        "failure_type": failure_type,
         "prediction_path": str(prediction_path),
         "train_log_path": str(get_paths().trial_logs_dir(output) / "train.log"),
     }
@@ -1581,7 +1946,7 @@ def run_workflow(
     manifest._write()
 
     # 代码来源: 链式执行从上一轮 agent2/code/ 继承, 否则从 experiment_dir 复制
-    code_src_dir = str(_existing_code_dir(prev_dir)) if is_chain else exp_dir
+    code_src_dir = str(_existing_code_dir(prev_dir)) if is_chain else str(_initial_code_source_dir(exp_dir))
     # 数据目录始终指向原始 baseline
     data_dir = str(get_paths().abs(get_paths().cfg.data.root))
     # 旧指标来源: 链式执行读上一轮的 outputs, 否则读 baseline/outputs
@@ -1767,7 +2132,7 @@ def run_workflow(
                 manifest.record_error("execute", str(e))
                 raise
 
-            train_ok = (comparison.get("primary", {}).get("new_wape", 999) != 999)
+            train_ok = not _needs_codegen_retry(comparison)
             _stage_log(
                 output_dir,
                 "execute",
@@ -1798,11 +2163,21 @@ def run_workflow(
                         "--output_dir", str(_trial_outputs_dir(output_dir)),
                         "--backtest_output_prefix", "fallback",
                     ]
-                    fb_result = subprocess.run(
-                        fallback_cmd,
-                        cwd=str(_existing_code_dir(output_dir)),
-                        capture_output=True, text=True, timeout=3600,
-                    )
+                    try:
+                        fb_result = subprocess.run(
+                            fallback_cmd,
+                            cwd=str(_existing_code_dir(output_dir)),
+                            capture_output=True, text=True, timeout=T3_TRAIN_TIMEOUT_SECONDS,
+                        )
+                    except subprocess.TimeoutExpired as e:
+                        fb_timeout = f"fallback training timed out after {e.timeout} seconds"
+                        _stage_log(output_dir, "execute", fb_timeout)
+                        fb_result = subprocess.CompletedProcess(
+                            args=fallback_cmd,
+                            returncode=124,
+                            stdout=_timeout_output_to_text(e.stdout),
+                            stderr=(_timeout_output_to_text(e.stderr).rstrip() + f"\n{fb_timeout}").strip(),
+                        )
                     _stage_log(output_dir, "execute", f"fallback training finished rc={fb_result.returncode}")
                     train_log_path.write_text(
                         (train_log_path.read_text(encoding="utf-8") if train_log_path.exists() else "") +
@@ -1856,6 +2231,25 @@ def run_workflow(
                         break
                 if not error_text:
                     error_text = "\n".join(lines[-20:])
+
+            failure_type = comparison.get("failure_type") if comparison else None
+            eval_error = comparison.get("eval_error") if comparison else None
+            error_text = (
+                f"failure_type={failure_type}\n"
+                f"eval_error={eval_error}\n\n"
+                f"{error_text}\n\n"
+                "Repair guidance:\n"
+                "- If failure_type=history_eval_contract_error, fix this before any training: "
+                "when --history_eval_only is passed, write the test split package_detail "
+                "contract and return before dish allocation.\n"
+                "- In history_eval_only, do not call allocate_dish_prediction_by_target_date, "
+                "build_store_dish_day_output, or write *_store_dish_day.csv.\n"
+                "- For train_timeout, do not extend the timeout; implement a bounded "
+                "--history_eval_only path that finishes quickly on the full --data_path.\n"
+                "- Avoid expensive full-table/groupby training in history_eval_only.\n"
+                "- Write package_detail contract columns: split,true_pos_cnt,pred_pos_cnt "
+                "for a test split; do not write the raw feature table.\n"
+            )
 
             fix_input = TextInput(text=(
                 f"训练失败, 以下是错误日志:\n\n```\n{error_text}\n```\n\n"

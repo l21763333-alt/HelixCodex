@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from codex_flow import (
+    _initial_code_source_dir,
     _write_data_refs,
     copy_source_to_trial,
     _normalize_trial_code_layout,
@@ -76,6 +79,44 @@ class TrialCodeLayoutTest(unittest.TestCase):
             self.assertFalse((code / "data").exists())
             self.assertFalse((code / "outputs").exists())
             self.assertFalse((code / "logs").exists())
+
+    def test_initial_code_source_prefers_git_mcp_worktree_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local_baseline = root / "Codex_flow" / "baseline"
+            git_baseline = root / "ForecastModel_worktree" / "baseline"
+            (local_baseline / "src").mkdir(parents=True)
+            (git_baseline / "src").mkdir(parents=True)
+            (local_baseline / "src" / "model.py").write_text("source = 'local'\n", encoding="utf-8")
+            (git_baseline / "src" / "model.py").write_text("source = 'git'\n", encoding="utf-8")
+            (git_baseline / "requirements.txt").write_text("lightgbm\n", encoding="utf-8")
+
+            fake_config = types.SimpleNamespace(
+                mcp=types.SimpleNamespace(
+                    git=types.SimpleNamespace(
+                        enabled=True,
+                        scope="baseline_model",
+                        repo_path="ForecastModel_worktree",
+                        baseline_dir="baseline",
+                    )
+                )
+            )
+
+            with (
+                patch("codex_flow.PROJECT_ROOT", root),
+                patch("codex_flow.get_config", return_value=fake_config),
+            ):
+                source = _initial_code_source_dir(local_baseline)
+                trial = root / "trial_001"
+                copied = copy_source_to_trial(str(source), str(trial))
+
+            self.assertEqual(source, git_baseline.resolve())
+            self.assertIn("src/model.py", [item.replace("\\", "/") for item in copied])
+            self.assertEqual(
+                (trial / "candidate" / "code" / "src" / "model.py").read_text(encoding="utf-8"),
+                "source = 'git'\n",
+            )
+            self.assertTrue((trial / "candidate" / "code" / "requirements.txt").exists())
 
     def test_data_refs_written_for_trial(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
