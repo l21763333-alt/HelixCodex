@@ -12,8 +12,8 @@ roots:
 
 data:
   mode: "reference_only"
-  root: "baseline/data"
-  primary: "baseline/data/dish_package_feature_df.csv"
+  root: "/data/dataworks_data"
+  primary: "/data/dataworks_data/dwd_forecast_package_feature_df.csv"
   auxiliary:
     - "baseline/data/holiday_imformation.csv"
 

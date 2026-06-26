@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from config import PathRegistry, load_config, load_flow_paths
+from config import PathRegistry, load_config, load_flow_paths, override_data_primary, reload_paths
 
 
 class PathConfigTest(unittest.TestCase):
@@ -41,6 +41,29 @@ trial:
             self.assertEqual(registry.cfg.trial.code_dir, "candidate/code")
             self.assertEqual(registry.cfg.trial.outputs_dir, "outputs/test_outputs")
             self.assertEqual(registry.trial_code_dir("runs/001/trial_001").parts[-2:], ("candidate", "code"))
+
+    def test_runtime_data_path_override_updates_primary_and_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "flow_paths.yaml"
+            base.write_text(
+                """
+data:
+  root: "baseline/data"
+  primary: "baseline/data/base.csv"
+""",
+                encoding="utf-8",
+            )
+
+            try:
+                reload_paths(base, root / "missing.local.yaml")
+                registry = override_data_primary("/tmp/runtime/train.csv")
+
+                self.assertEqual(registry.cfg.data.primary, "/tmp/runtime/train.csv")
+                self.assertEqual(registry.cfg.data.root, "/tmp/runtime")
+                self.assertEqual(str(registry.data_primary()), "/tmp/runtime/train.csv")
+            finally:
+                reload_paths()
 
     def test_feishu_credentials_only_load_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

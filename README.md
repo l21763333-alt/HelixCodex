@@ -110,7 +110,8 @@ mcp:
 ```yaml
 data:
   mode: "reference_only"
-  primary: "baseline/data/dish_package_feature_df.csv"
+  root: "/data/dataworks_data"
+  primary: "/data/dataworks_data/dwd_forecast_package_feature_df.csv"
   auxiliary:
     - "baseline/data/holiday_imformation.csv"
 
@@ -126,7 +127,7 @@ global_artifacts:
   feishu_action_log: "runs/feishu_card_actions.jsonl"
 ```
 
-如果本机目录和默认路径不同，创建 `flow_paths.local.yaml` 覆盖本机路径，不要把本机私有路径提交到仓库。
+如果本机目录和默认路径不同，可以创建 `flow_paths.local.yaml` 覆盖本机路径，或在启动时用 `--data-path` 覆盖本次训练主数据路径。
 
 ### 4. 配置环境变量
 
@@ -231,7 +232,8 @@ source venv/bin/activate
 python codex_flow.py \
   --experiment baseline \
   --ask "分析预测误差，提出特征实验并验证" \
-  --output runs/trial_001
+  --output runs/trial_001 \
+  --data-path /data/dataworks_data/dwd_forecast_package_feature_df.csv
 ```
 
 多轮自动优化。Git MCP 启用时会在 loop 启动时同步 `mcp.git.repo.path` 指向的模型 worktree，并只管理 `model.publish_paths`；飞书启用时会生成审核卡片并等待人工命令或超时：
@@ -242,6 +244,7 @@ python loop.py \
   --experiment baseline \
   --ask "从 supply_chain develop 分支同步 package_forecast 模型代码，基于当前配置进行预测优化实验" \
   --output runs/001 \
+  --data-path /data/dataworks_data/dwd_forecast_package_feature_df.csv \
   --max-trials 3 \
   --review-timeout 6000
 ```
@@ -396,9 +399,8 @@ loop 启动
 项目采用“固定数据源 + trial 引用”的布局，避免每轮复制 4GB+ CSV：
 
 ```text
-baseline/data/
-  dish_package_feature_df.csv
-  holiday_imformation.csv
+/data/dataworks_data/
+  dwd_forecast_package_feature_df.csv
 
 runs/<run>/trial_xxx/
   inputs/data_refs.json

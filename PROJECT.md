@@ -181,13 +181,13 @@ runs/git_action_log.jsonl
 ## 推荐目录结构
 
 ```text
+/data/dataworks_data/
+  dwd_forecast_package_feature_df.csv
+
 Codex_flow/
   baseline/
     src/
     requirements.txt
-    data/
-      dish_package_feature_df.csv
-      holiday_imformation.csv
 
   runs/
     020/

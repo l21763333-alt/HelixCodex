@@ -16,7 +16,7 @@ from codex_flow import (
     _write_fallback_report,
     THREAD_CODEGEN,
 )
-from config import get_paths
+from config import get_paths, override_data_primary, reload_paths
 
 
 class TrialCodeLayoutTest(unittest.TestCase):
@@ -56,6 +56,25 @@ class TrialCodeLayoutTest(unittest.TestCase):
             self.assertIn("--data_path", cmd)
             self.assertEqual(cmd[cmd.index("--data_path") + 1], str(get_paths().data_primary()))
             self.assertEqual(cmd[cmd.index("--output_dir") + 1], str(get_paths().trial_outputs_dir(trial)))
+
+    def test_execution_plan_uses_runtime_data_path_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = Path(tmp) / "trial_001"
+            train_py = trial / "candidate" / "code" / "train.py"
+            train_py.parent.mkdir(parents=True)
+            train_py.write_text("print('ok')\n", encoding="utf-8")
+
+            try:
+                override_data_primary("/tmp/runtime/train.csv")
+                cmd = _resolve_train_command(
+                    ["python", "candidate/code/train.py"],
+                    trial,
+                    "trial_001",
+                )
+
+                self.assertEqual(cmd[cmd.index("--data_path") + 1], "/tmp/runtime/train.csv")
+            finally:
+                reload_paths()
 
     def test_copy_source_does_not_copy_data_or_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

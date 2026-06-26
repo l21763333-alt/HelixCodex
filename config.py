@@ -102,8 +102,8 @@ class FlowPathRoots:
 @dataclass
 class FlowPathData:
     mode: str = "reference_only"
-    root: str = "baseline/data"
-    primary: str = "baseline/data/dish_package_feature_df.csv"
+    root: str = "/data/dataworks_data"
+    primary: str = "/data/dataworks_data/dwd_forecast_package_feature_df.csv"
     auxiliary: list[str] = field(default_factory=lambda: [
         "baseline/data/holiday_imformation.csv",
     ])
@@ -928,6 +928,27 @@ def reload_paths(
     global _paths
     _paths = PathRegistry(load_flow_paths(path, local_path))
     return _paths
+
+
+def override_data_primary(
+    data_path: Path | str,
+    *,
+    data_root: Path | str | None = None,
+) -> PathRegistry:
+    """Override the primary training data path for the current process."""
+    value = str(data_path).strip()
+    if not value:
+        raise ValueError("data_path must not be empty")
+
+    paths = get_paths()
+    primary = Path(value).expanduser()
+    paths.cfg.data.primary = str(primary)
+
+    root = Path(data_root).expanduser() if data_root is not None else primary.parent
+    if str(root) not in ("", "."):
+        paths.cfg.data.root = str(root)
+
+    return paths
 
 
 # 便捷函数

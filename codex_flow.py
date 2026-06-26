@@ -47,7 +47,7 @@ from openai_codex.generated.v2_all import (
     GetAccountRateLimitsResponse,
     CodexErrorInfoValue,
 )
-from config import PROJECT_ROOT, build_codex_config, get_config, get_paths
+from config import PROJECT_ROOT, build_codex_config, get_config, get_paths, override_data_primary
 
 # ============================================================
 # 固定路径 — skills 目录 & 确定性执行脚本
@@ -2070,6 +2070,7 @@ def run_workflow(
     codex: Codex | None = None,
     resume: bool = True,
     resume_from_phase: str | None = None,
+    data_path: str | None = None,
 ) -> WorkflowManifest:
     """
     ComboScope Codex 多线程工作流 — 单次 Codex Session
@@ -2080,12 +2081,15 @@ def run_workflow(
 
     链式执行: --experiment baseline --previous-trial runs/trial_N
       - 代码从 previous_trial candidate/code/ 继承 (保留 codegen 修改)
-      - 数据始终从 experiment_dir/data/ 读取
+      - 数据路径来自 flow_paths.yaml 或运行时 data_path 覆盖
       - baseline 指标从 previous_trial/outputs/ 读取
 
     codex 参数: 传入已认证的 Codex 实例时, 跳过 session 创建和认证步骤,
     直接复用已有 session。用于循环模式 (run_loop) 避免重复启动 app-server。
     """
+    if data_path:
+        override_data_primary(data_path)
+
     trial_id = Path(output_dir).name
     exp_dir = str(Path(experiment_dir).resolve())
     out_dir = str(Path(output_dir).resolve())
@@ -2116,7 +2120,7 @@ def run_workflow(
 
     # 代码来源: 链式执行从上一轮 candidate/code/ 继承, 否则从 experiment_dir 复制
     code_src_dir = str(_existing_code_dir(prev_dir)) if is_chain else str(_initial_code_source_dir(exp_dir))
-    # 数据目录始终指向原始 baseline
+    # 数据目录来自 flow_paths.yaml 或运行时 data_path 覆盖
     data_dir = str(get_paths().abs(get_paths().cfg.data.root))
     # 旧指标来源: 链式执行读上一轮的 outputs, 否则读 baseline/outputs
     baseline_metric_dir = str(_trial_outputs_dir(prev_dir)) if is_chain else str(Path(exp_dir) / "outputs")
@@ -2547,6 +2551,7 @@ def run_loop(
     start_trial: int = 1,
     max_sleep_hours: float = 24.0,
     notify_chat_id: str = "",
+    data_path: str | None = None,
 ) -> list[WorkflowManifest]:
     """
     循环执行多轮 Codex 优化实验。
@@ -2558,6 +2563,9 @@ def run_loop(
     Returns:
         每轮成功的 manifest 列表
     """
+    if data_path:
+        override_data_primary(data_path)
+
     # 延迟导入避免循环依赖
     import lark_notify as lark
     if notify_chat_id:
@@ -2611,6 +2619,7 @@ def run_loop(
                     output_dir=trial_output,
                     previous_trial=prev_trial,
                     codex=codex,
+                    data_path=data_path,
                 )
                 manifests.append(manifest)
                 prev_trial = trial_output
@@ -2688,6 +2697,7 @@ def main() -> int:
     parser.add_argument("--output", default="runs/trial_001", help="输出目录 (默认 runs/trial_001)")
     parser.add_argument("--previous-trial", default=None, help="继承上一轮 trial 的代码和指标 (链式优化)")
     parser.add_argument("--model-repo", default=None, help="Git MCP 模型仓库 repo_id (覆盖 mcp.git.active_repo)")
+    parser.add_argument("--data-path", default=None, help="训练主数据 CSV 路径 (覆盖 flow_paths.yaml data.primary)")
 
     # 循环模式
     parser.add_argument("--loop", action="store_true", help="启用循环模式: 一次认证, 连续多轮实验")
@@ -2719,6 +2729,7 @@ def main() -> int:
                 start_trial=args.start_trial,
                 max_sleep_hours=args.max_sleep_hours,
                 notify_chat_id=args.notify_chat_id,
+                data_path=args.data_path,
             )
             return 0
 
@@ -2728,6 +2739,7 @@ def main() -> int:
             ask=args.ask,
             output_dir=args.output,
             previous_trial=args.previous_trial,
+            data_path=args.data_path,
         )
     except Exception as exc:
         print(f"\n[FATAL] 工作流失败: {exc}", file=sys.stderr)

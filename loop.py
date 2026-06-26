@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import get_config, get_paths, reload_config
+from config import get_config, get_paths, override_data_primary, reload_config
 from lark_notify import (
     feishu_review,
     notify_loop_start,
@@ -90,7 +90,11 @@ class AIExperimentLoop:
         human_review: bool | None = None,
         review_timeout: int | None = None,
         model_repo: str | None = None,
+        data_path: str | None = None,
     ):
+        if data_path:
+            override_data_primary(data_path)
+
         self.cfg = get_config()
         self.git_repo_id = model_repo or self.cfg.mcp.git.active_repo or "default"
         self.cfg.mcp.git.active_repo = self.git_repo_id
@@ -99,6 +103,7 @@ class AIExperimentLoop:
         # ── 实验参数 ──
         self.experiment_dir = Path(experiment_dir)
         self.original_ask = ask
+        self.data_path = data_path
         self.output_base = Path(output_base)
         self.output_base.mkdir(parents=True, exist_ok=True)
         self.run_label = self._make_run_label(self.output_base)
@@ -312,6 +317,8 @@ class AIExperimentLoop:
                     output_dir=output_dir,
                     previous_trial=self.current_previous_trial,
                 )
+                if self.data_path:
+                    kwargs["data_path"] = self.data_path
                 try:
                     return flow.run_workflow(
                         **kwargs,
@@ -321,6 +328,7 @@ class AIExperimentLoop:
                 except TypeError as e:
                     if "unexpected keyword" not in str(e):
                         raise
+                    kwargs.pop("data_path", None)
                     return flow.run_workflow(**kwargs)
 
             while True:
@@ -1056,6 +1064,10 @@ def main():
         help="Git MCP 模型仓库 repo_id (覆盖 mcp.git.active_repo)",
     )
     parser.add_argument(
+        "--data-path", type=str, default=None,
+        help="训练主数据 CSV 路径 (覆盖 flow_paths.yaml data.primary)",
+    )
+    parser.add_argument(
         "--config", type=str, default=None,
         help="指定 YAML 配置文件路径",
     )
@@ -1076,6 +1088,7 @@ def main():
         human_review=not args.no_review,
         review_timeout=args.review_timeout,
         model_repo=args.model_repo,
+        data_path=args.data_path,
     )
 
     # 执行
