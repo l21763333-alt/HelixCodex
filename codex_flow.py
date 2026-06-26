@@ -48,6 +48,7 @@ from openai_codex.generated.v2_all import (
     CodexErrorInfoValue,
 )
 from config import PROJECT_ROOT, build_codex_config, get_config, get_paths, override_data_primary
+from codex_gateway import ensure_codex_gateway
 
 # ============================================================
 # 固定路径 — skills 目录 & 确定性执行脚本
@@ -2522,6 +2523,7 @@ def run_workflow(
         # 循环模式: 复用外部传入的已认证 session
         _execute_trial(codex)
     else:
+        ensure_codex_gateway()
         # 独立模式: 创建自己的 Codex session
         with Codex(config=CODEX_CONFIG) as owned_codex:
             _execute_trial(owned_codex)
@@ -2583,6 +2585,8 @@ def run_loop(
     print(f"# 最大迭代: {max_iter} | 目标 WAPE: {target_wape or '无'}")
     print(f"# 最长等待: {max_sleep_hours}h")
     print(f"{'#'*60}")
+
+    ensure_codex_gateway()
 
     with Codex(config=CODEX_CONFIG) as codex:
         # ── 一次性认证 ──

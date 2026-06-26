@@ -169,6 +169,35 @@ set +a
 | `FEISHU_CHAT_ID` | 启用飞书通知时必需 | 飞书目标群聊 |
 | `FEISHU_VERIFICATION_TOKEN` | HTTP 回调兼容入口可选 | 飞书卡片回调校验 token |
 
+如果服务器访问 Codex 需要走 Cloudflare Access 网关，可以使用项目内置的 `.tools/cloudflared`。先在 `flow_config.yaml` 填入网关配置：
+
+```yaml
+codex_gateway:
+  enabled: true
+  mode: "cloudflared_access_tcp"
+  cloudflared_path: ".tools/cloudflared"
+  hostname: "your-codex-gateway.example.com"
+  listener: "127.0.0.1:18080"
+  proxy_url: "http://127.0.0.1:18080"
+```
+
+`hostname` 必须替换成实际的 Cloudflare Access 应用域名；如果网关要求 service token，再通过环境变量设置 `CODEX_GATEWAY_SERVICE_TOKEN_ID` 和 `CODEX_GATEWAY_SERVICE_TOKEN_SECRET`。没有 service token 时先做一次 Access 登录，配置完成后可手动检查，也可以让 `codex_login.py` 和 `codex_flow.py` 自动启动：
+
+```bash
+python codex_gateway.py login
+python codex_gateway.py start
+python codex_gateway.py status
+```
+
+如果机器上已经有可用的 `HTTP_PROXY` / `HTTPS_PROXY`，可以不填 Cloudflare Access `hostname`，直接复用当前代理：
+
+```bash
+export CODEX_GATEWAY_ENABLED=true
+export CODEX_GATEWAY_MODE=proxy_env_only
+# 可选：不设置时会复用当前 HTTPS_PROXY / HTTP_PROXY
+export CODEX_GATEWAY_PROXY_URL="$HTTPS_PROXY"
+```
+
 ### 5. 准备模型 Git worktree
 
 默认测试配置要求 supply_chain 模型仓库在项目同级目录，模型根目录由 `mcp.git.model.root` 指定：
@@ -358,6 +387,7 @@ Codex_flow/
   lark_card_bot.py             # 飞书交互卡片 HTTP 回调兼容服务
   card_server.py               # HTTP 卡片服务兼容入口
   codex_login.py               # Codex 登录工具
+  codex_gateway.py             # .tools/cloudflared 网关启动和状态检查
 
   flow_config.yaml             # 行为配置
   flow_paths.yaml              # 路径契约

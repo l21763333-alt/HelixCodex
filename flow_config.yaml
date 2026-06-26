@@ -13,6 +13,21 @@ auth:
   openai_api_key: ""
   codex_api_key: ""
 
+codex_gateway:
+  # Use the existing HTTP_PROXY/HTTPS_PROXY by default on this server.
+  # Switch mode to cloudflared_access_tcp only after filling a real Access hostname.
+  enabled: true
+  mode: "proxy_env_only"
+  cloudflared_path: ".tools/cloudflared"
+  hostname: ""
+  listener: "127.0.0.1:18080"
+  proxy_url: ""
+  log_file: ".codex_home/cloudflared-codex.log"
+  pid_file: ".codex_home/cloudflared-codex.pid"
+  log_level: "info"
+  service_token_id: ""
+  service_token_secret: ""
+
 feishu:
   enabled: true
   # Credentials and identifiers are read only from environment variables:

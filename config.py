@@ -593,6 +593,21 @@ class McpConfig:
 
 
 @dataclass
+class CodexGatewayConfig:
+    enabled: bool = False
+    mode: str = "cloudflared_access_tcp"
+    cloudflared_path: str = ".tools/cloudflared"
+    hostname: str = ""
+    listener: str = "127.0.0.1:18080"
+    proxy_url: str = ""
+    log_file: str = ".codex_home/cloudflared-codex.log"
+    pid_file: str = ".codex_home/cloudflared-codex.pid"
+    log_level: str = "info"
+    service_token_id: str = ""
+    service_token_secret: str = ""
+
+
+@dataclass
 class Config:
     model: str = "gpt-5.5"
     codex_home: str = ""
@@ -603,6 +618,7 @@ class Config:
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    codex_gateway: CodexGatewayConfig = field(default_factory=CodexGatewayConfig)
 
     @property
     def api_key(self) -> str:
@@ -625,12 +641,53 @@ class Config:
         return tuple(overrides)
 
 
+def _existing_proxy_url() -> str:
+    for key in (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+    ):
+        value = os.environ.get(key, "")
+        if value:
+            return value
+    return ""
+
+
+def _listener_proxy_url(cfg: Config) -> str:
+    return f"http://{cfg.codex_gateway.listener}"
+
+
+def _codex_gateway_proxy_url(cfg: Config) -> str:
+    listener_proxy = _listener_proxy_url(cfg)
+    if cfg.codex_gateway.mode == "proxy_env_only":
+        if cfg.codex_gateway.proxy_url and cfg.codex_gateway.proxy_url != listener_proxy:
+            return cfg.codex_gateway.proxy_url
+        return _existing_proxy_url() or cfg.codex_gateway.proxy_url
+    return cfg.codex_gateway.proxy_url or listener_proxy
+
+
 def build_codex_config() -> CodexConfig:
     cfg = get_config()
     env: dict[str, str] = {
         "RUST_LOG": "info",
         "CODEX_HOME": cfg.resolved_codex_home,
     }
+    if cfg.codex_gateway.enabled:
+        proxy_url = _codex_gateway_proxy_url(cfg)
+        if proxy_url:
+            env.update({
+                "HTTP_PROXY": proxy_url,
+                "HTTPS_PROXY": proxy_url,
+                "ALL_PROXY": proxy_url,
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "all_proxy": proxy_url,
+                "NO_PROXY": "127.0.0.1,localhost",
+                "no_proxy": "127.0.0.1,localhost",
+            })
     return CodexConfig(env=env, config_overrides=cfg.codex_config_overrides())
 
 
@@ -648,6 +705,13 @@ ENV_OVERRIDES = {
     "CODEX_API_KEY":       ("_top", "codex_api_key"),
     "CODEX_HOME":          ("_top", "codex_home"),
     "CODEX_MODEL":         ("_top", "model"),
+    "CODEX_GATEWAY_ENABLED": ("codex_gateway", "enabled"),
+    "CODEX_GATEWAY_MODE": ("codex_gateway", "mode"),
+    "CODEX_GATEWAY_HOSTNAME": ("codex_gateway", "hostname"),
+    "CODEX_GATEWAY_LISTENER": ("codex_gateway", "listener"),
+    "CODEX_GATEWAY_PROXY_URL": ("codex_gateway", "proxy_url"),
+    "CODEX_GATEWAY_SERVICE_TOKEN_ID": ("codex_gateway", "service_token_id"),
+    "CODEX_GATEWAY_SERVICE_TOKEN_SECRET": ("codex_gateway", "service_token_secret"),
 }
 
 
@@ -656,7 +720,14 @@ def _set_nested(obj, path: list[str], value) -> None:
     target = obj
     for part in path[:-1]:
         target = getattr(target, part)
-    setattr(target, path[-1], value)
+    current = getattr(target, path[-1], None)
+    setattr(target, path[-1], _coerce_env_value(current, value))
+
+
+def _coerce_env_value(current, value: str):
+    if isinstance(current, bool):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value
 
 
 def _apply_section(config: Config, data: dict, section: str, fields: list[str]) -> None:
@@ -861,6 +932,10 @@ def load_config(path: Path | str | None = None) -> Config:
                         "recoverable_codex_phases", "degradable_phases"])
         _apply_section(config, raw, "paths",
                        ["experiment_dir", "runs_dir", "skills_dir"])
+        _apply_section(config, raw, "codex_gateway",
+                       ["enabled", "mode", "cloudflared_path", "hostname",
+                        "listener", "proxy_url", "log_file", "pid_file",
+                        "log_level", "service_token_id", "service_token_secret"])
         _apply_section(config.mcp, raw.get("mcp", {}), "lark",
                        ["enabled", "backend", "server_name"])
         _apply_section(config.mcp, raw.get("mcp", {}), "git",
