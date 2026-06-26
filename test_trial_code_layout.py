@@ -91,15 +91,20 @@ class TrialCodeLayoutTest(unittest.TestCase):
             (git_baseline / "src" / "model.py").write_text("source = 'git'\n", encoding="utf-8")
             (git_baseline / "requirements.txt").write_text("lightgbm\n", encoding="utf-8")
 
+            fake_repo = types.SimpleNamespace(
+                repo_path="ForecastModel_worktree",
+                baseline_dir="baseline",
+                source_dir="baseline/src",
+                requirements="baseline/requirements.txt",
+            )
+            fake_git = types.SimpleNamespace(
+                enabled=True,
+                scope="baseline_model",
+                active_repo="default",
+                resolve_repo=lambda repo_id=None: fake_repo,
+            )
             fake_config = types.SimpleNamespace(
-                mcp=types.SimpleNamespace(
-                    git=types.SimpleNamespace(
-                        enabled=True,
-                        scope="baseline_model",
-                        repo_path="ForecastModel_worktree",
-                        baseline_dir="baseline",
-                    )
-                )
+                mcp=types.SimpleNamespace(git=fake_git)
             )
 
             with (

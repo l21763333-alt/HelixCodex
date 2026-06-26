@@ -20,6 +20,7 @@ feishu:
   #   FEISHU_APP_SECRET
   #   FEISHU_CHAT_ID
   #   FEISHU_VERIFICATION_TOKEN
+  #   FEISHU_ENCRYPT_KEY (optional, only if callback encryption is enabled)
   poll_interval: 5
 
 loop:
@@ -67,22 +68,39 @@ mcp:
   git:
     enabled: true
     scope: "baseline_model"
-    repo_path: "."
-    baseline_dir: "baseline"
+    active_repo: "supply_chain_package_forecast"
+    repositories:
+      supply_chain_package_forecast:
+        repo_path: "../SupplyChain_worktree"
+        baseline_dir: "src/supply_chain/forecast/package_forecast"
+        source_dir: "src/supply_chain/forecast/package_forecast"
+        requirements: "src/supply_chain/forecast/package_forecast/requirements.txt"
+        allowed_paths:
+          - "src/supply_chain/forecast/package_forecast/**"
+        branch_prefix: "model-exp/"
+        remote: "origin"
+        base_branch: "develop"
+        push_target_branch: "develop"
+        push_on_keep: true
+        create_pr_on_keep: false
+        pr_draft: true
+    repo_path: "../SupplyChain_worktree"
+    baseline_dir: "src/supply_chain/forecast/package_forecast"
+    source_dir: "src/supply_chain/forecast/package_forecast"
+    requirements: "src/supply_chain/forecast/package_forecast/requirements.txt"
     allowed_paths:
-      - "baseline/src/**"
-      - "baseline/requirements.txt"
+      - "src/supply_chain/forecast/package_forecast/**"
     trial_code_subdir: "candidate/code"
     branch_prefix: "model-exp/"
-    remote: "forecastops"
-    base_branch: "ForecastModel"
+    remote: "origin"
+    base_branch: "develop"
     sync_on_loop_start: true
     sync_before_each_trial: false
     publish_via_subagent: true
     push_on_keep: true
     create_pr_on_keep: false
     pr_draft: true
-    push_target_branch: "ForecastModel"
+    push_target_branch: "develop"
     server_transport: "stdio"
     server_command: "python"
     server_args:

@@ -11,7 +11,7 @@ class FakePublishGit:
         self.blocked = blocked
         self.calls: list[tuple[str, str]] = []
 
-    def sync_remote_base(self, remote: str, base_branch: str) -> dict:
+    def sync_remote_base(self, remote: str, base_branch: str, **kwargs) -> dict:
         self.calls.append(("sync", f"{remote}/{base_branch}"))
         if self.blocked:
             return {
@@ -32,15 +32,15 @@ class FakePublishGit:
             "branch_after": base_branch,
         }
 
-    def apply_trial_to_baseline(self, trial_code_dir: Path, trial_id: str) -> dict:
+    def apply_trial_to_baseline(self, trial_code_dir: Path, trial_id: str, **kwargs) -> dict:
         self.calls.append(("apply", trial_id))
         return {"trial_id": trial_id, "trial_code_dir": str(trial_code_dir)}
 
-    def commit_baseline_model_update(self, trial_id: str, metrics: dict, report_path: str, supplement: str | None) -> dict:
+    def commit_baseline_model_update(self, trial_id: str, metrics: dict, report_path: str, supplement: str | None, **kwargs) -> dict:
         self.calls.append(("commit", trial_id))
         return {"committed": True, "trial_id": trial_id, "commit": "commit-sha"}
 
-    def push_model_trial_branch(self, branch: str, remote: str, target_branch: str | None = None) -> dict:
+    def push_model_trial_branch(self, branch: str, remote: str, target_branch: str | None = None, **kwargs) -> dict:
         self.calls.append(("push", target_branch or branch))
         return {
             "pushed": True,
@@ -49,11 +49,11 @@ class FakePublishGit:
             "target_branch": target_branch or branch,
         }
 
-    def create_model_pr(self, branch: str, base: str, body: str, title: str, draft: bool) -> dict:
+    def create_model_pr(self, branch: str, base: str, body: str, title: str, draft: bool, **kwargs) -> dict:
         self.calls.append(("pr", branch))
         return {"created": False, "draft_path": "/fake/pr.md", "branch": branch, "base": base}
 
-    def get_model_repo_state(self) -> dict:
+    def get_model_repo_state(self, **kwargs) -> dict:
         self.calls.append(("state", ""))
         return {"branch": "model-exp/run_trial_001", "head": "commit-sha", "model_dirty": False}
 

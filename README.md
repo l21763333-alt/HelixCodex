@@ -111,7 +111,8 @@ export CODEX_HOME="/srv/codex/Codex_flow/.codex_home"
 export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 export FEISHU_CHAT_ID="oc_xxx"
-export FEISHU_VERIFICATION_TOKEN="xxx"
+# Optional: only needed for HTTP callback compatibility
+# export FEISHU_VERIFICATION_TOKEN="xxx"
 ```
 
 服务器持久化建议写入运维侧环境注入机制，例如 shell profile、systemd `EnvironmentFile` 或 CI/CD secret。使用 `.env` 文件时，需要在启动前显式 source：
@@ -133,7 +134,7 @@ set +a
 | `FEISHU_APP_ID` | 启用飞书时必需 | 飞书应用 ID |
 | `FEISHU_APP_SECRET` | 启用飞书时必需 | 飞书应用密钥 |
 | `FEISHU_CHAT_ID` | 启用飞书通知时必需 | 飞书目标群聊 |
-| `FEISHU_VERIFICATION_TOKEN` | 启用卡片回调时必需 | 飞书卡片回调校验 token |
+| `FEISHU_VERIFICATION_TOKEN` | HTTP 回调兼容入口可选 | 飞书卡片回调校验 token |
 
 ### 5. 准备模型 Git worktree
 
@@ -173,7 +174,7 @@ Codex Flow 的 Git MCP 自身会记录同步结果到 `runs/git_action_log.jsonl
 
 ```bash
 source venv/bin/activate
-python codex_login.py --logout
+python3 codex_login.py --logout
 python codex_login.py
 ```
 
@@ -226,11 +227,18 @@ python loop.py \
   --no-review
 ```
 
-飞书卡片回调服务单独启动。需要先把公网网关或内网穿透地址映射到 `/feishu/card`：
+飞书消息和卡片点击推荐通过 SDK 长连接接入，不需要公网网关或内网穿透。先启动长连接进程，再运行 `loop.py`：
 
 ```bash
 source venv/bin/activate
-python lark_card_bot.py --host 0.0.0.0 --port 8787
+python lark_channel_bot.py
+```
+
+也可以单独发送一张测试审核卡片：
+
+```bash
+source venv/bin/activate
+python lark_channel_bot.py --send-test-card
 ```
 
 ## 快速开始
@@ -270,7 +278,8 @@ python loop.py \
 export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 export FEISHU_CHAT_ID="oc_xxx"
-export FEISHU_VERIFICATION_TOKEN="xxx"
+# Optional: only needed for HTTP callback compatibility
+# export FEISHU_VERIFICATION_TOKEN="xxx"
 ```
 
 ## 当前项目结构
@@ -311,8 +320,9 @@ Codex_flow/
   config.py                    # flow_config.yaml + flow_paths.yaml 配置加载
   git_subagent.py              # Git subagent 入口
   lark_notify.py               # 飞书消息、命令、卡片和恢复通知
-  lark_card_bot.py             # 飞书交互卡片回调服务
-  card_server.py               # 卡片服务相关入口
+  lark_channel_bot.py          # 飞书 SDK 长连接消息/卡片接收服务
+  lark_card_bot.py             # 飞书交互卡片 HTTP 回调兼容服务
+  card_server.py               # HTTP 卡片服务兼容入口
   codex_login.py               # Codex 登录工具
 
   flow_config.yaml             # 行为配置
@@ -442,7 +452,7 @@ mcp:
 | `FEISHU_APP_ID` | 飞书应用 ID |
 | `FEISHU_APP_SECRET` | 飞书应用密钥 |
 | `FEISHU_CHAT_ID` | 飞书目标群聊 |
-| `FEISHU_VERIFICATION_TOKEN` | 飞书卡片回调校验 token |
+| `FEISHU_VERIFICATION_TOKEN` | 飞书 HTTP 回调校验 token，长连接主路径可不设 |
 
 ## 常用命令
 
@@ -494,24 +504,38 @@ python loop.py \
   --no-review
 ```
 
-### 启动飞书卡片回调服务
+### 启动飞书 SDK 长连接服务
+
+```bash
+source venv/bin/activate
+python lark_channel_bot.py
+```
+
+该进程通过 `lark-oapi` 的 WebSocket 长连接接收文本消息和卡片按钮事件，并写入本地动作日志；不需要配置公网回调地址或内网穿透。
+
+发送测试卡片：
+
+```bash
+source venv/bin/activate
+python lark_channel_bot.py --send-test-card
+```
+
+HTTP 回调服务仍保留为兼容入口。只有使用该入口时，才需要在飞书开发者后台配置卡片回调地址：
+
+```text
+https://<public-host>/feishu/card
+```
 
 ```bash
 source venv/bin/activate
 python lark_card_bot.py --host 0.0.0.0 --port 8787
 ```
 
-飞书开发者后台的卡片回调地址配置为：
-
-```text
-https://<public-host>/feishu/card
-```
-
 更多细节见 `LARK_CARD_BOT.md`。
 
 ## 人工审核与恢复命令
 
-飞书审核支持文本命令和交互卡片按钮。动作会写入：
+飞书审核支持文本命令和交互卡片按钮。长连接服务和 HTTP 兼容回调都会把动作写入：
 
 ```text
 runs/feishu_card_actions.jsonl
@@ -590,5 +614,5 @@ python -m unittest test_path_config.py
 ## 相关文档
 
 - `PROJECT.md`：更完整的架构、状态机、恢复机制和发布链路说明。
-- `LARK_CARD_BOT.md`：飞书卡片回调服务配置和本地测试说明。
+- `LARK_CARD_BOT.md`：飞书 HTTP 卡片回调兼容入口配置和本地测试说明；主路径优先使用 `lark_channel_bot.py` 长连接。
 - `REPORT.md` / `SUMMARY.md` / `TECHNICAL_PROPOSAL.md`：历史报告、总结和技术方案材料。

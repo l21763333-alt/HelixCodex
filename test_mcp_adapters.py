@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import lark_notify
 from lark_notify import normalize_supplement, notify_command_result, wait_for_review_event
 from mcp_servers.lark_research_server.server import feishu_review_via_mcp, parse_feedback
+from config import GitMcpConfig, GitRepositoryConfig
 from mcp_servers.git_research_server import baseline_git_server as git_mcp
 
 
@@ -39,6 +41,52 @@ class LarkMcpAdapterTest(unittest.TestCase):
         sent = send.call_args.args[0]
         self.assertNotIn("raw", sent)
         self.assertNotIn("补充已注入", sent)
+
+    def test_send_prefers_sdk_when_available(self) -> None:
+        with (
+            patch("lark_notify._send_via_sdk", return_value=True) as sdk_send,
+            patch("lark_notify._send_via_http", return_value=True) as http_send,
+        ):
+            self.assertTrue(lark_notify._send("interactive", "{}", "oc_test"))
+
+        sdk_send.assert_called_once_with("interactive", "{}", "oc_test")
+        http_send.assert_not_called()
+
+    def test_send_falls_back_to_http_when_sdk_unavailable(self) -> None:
+        with (
+            patch("lark_notify._send_via_sdk", return_value=None) as sdk_send,
+            patch("lark_notify._send_via_http", return_value=True) as http_send,
+        ):
+            self.assertTrue(lark_notify._send("interactive", "{}", "oc_test"))
+
+        sdk_send.assert_called_once_with("interactive", "{}", "oc_test")
+        http_send.assert_called_once_with("interactive", "{}", "oc_test")
+
+    def test_sdk_send_builds_create_message_request(self) -> None:
+        if lark_notify.CreateMessageRequest is None:
+            self.skipTest("lark-oapi is not installed")
+
+        captured = {}
+
+        def create(request):
+            captured["request"] = request
+            return types.SimpleNamespace(success=lambda: True, code=0, msg="ok")
+
+        fake_client = types.SimpleNamespace(
+            im=types.SimpleNamespace(
+                v1=types.SimpleNamespace(
+                    message=types.SimpleNamespace(create=create),
+                ),
+            ),
+        )
+        with patch("lark_notify._get_sdk_client", return_value=fake_client):
+            self.assertTrue(lark_notify._send_via_sdk("interactive", "{}", "oc_test"))
+
+        request = captured["request"]
+        self.assertEqual(request.receive_id_type, "chat_id")
+        self.assertEqual(request.request_body.receive_id, "oc_test")
+        self.assertEqual(request.request_body.msg_type, "interactive")
+        self.assertEqual(request.request_body.content, "{}")
 
     def test_mcp_review_does_not_return_raw_event_as_supplement(self) -> None:
         with (
@@ -116,6 +164,52 @@ class GitMcpAdapterTest(unittest.TestCase):
             self.assertEqual(diff["added"], 1)
             self.assertIn("M src/model.py", diff["summary"])
             self.assertIn("A src/extra.py", diff["summary"])
+
+    def test_repo_id_selects_configured_model_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a = root / "repo_a"
+            repo_b = root / "repo_b"
+            (repo_a / "model" / "src").mkdir(parents=True)
+            (repo_b / "custom" / "source").mkdir(parents=True)
+            trial_src = root / "runs" / "trial_001" / "candidate" / "code" / "src"
+            trial_src.mkdir(parents=True)
+            (repo_b / "custom" / "source" / "model.py").write_text("x = 1\n", encoding="utf-8")
+            (trial_src / "model.py").write_text("x = 2\n", encoding="utf-8")
+
+            git_cfg = GitMcpConfig(
+                active_repo="repo_b",
+                repositories={
+                    "repo_a": GitRepositoryConfig(
+                        repo_path=str(repo_a),
+                        baseline_dir="model",
+                        source_dir="model/src",
+                        requirements="model/requirements.txt",
+                    ),
+                    "repo_b": GitRepositoryConfig(
+                        repo_path=str(repo_b),
+                        baseline_dir="custom",
+                        source_dir="custom/source",
+                        requirements="custom/req.txt",
+                        allowed_paths=["custom/source/**", "custom/req.txt"],
+                        branch_prefix="b/",
+                        remote="upstream",
+                        base_branch="prod",
+                    ),
+                },
+            )
+            fake_config = types.SimpleNamespace(mcp=types.SimpleNamespace(git=git_cfg))
+
+            with patch.object(git_mcp, "get_config", return_value=fake_config):
+                ctx = git_mcp._repo_context("repo_b")
+                diff = git_mcp.diff_trial_model_code(root / "runs" / "trial_001" / "candidate" / "code", repo_id="repo_b")
+
+            self.assertEqual(ctx.repo_id, "repo_b")
+            self.assertEqual(ctx.repo_path, repo_b.resolve())
+            self.assertEqual(ctx.source_dir, (repo_b / "custom" / "source").resolve())
+            self.assertEqual(ctx.allowed_pathspecs, ["custom/source", "custom/req.txt"])
+            self.assertEqual(diff["changed"], 1)
+            self.assertEqual(diff["repo_id"], "repo_b")
 
 
 if __name__ == "__main__":

@@ -101,6 +101,135 @@ class StageRecoveryFlowTest(unittest.TestCase):
             self.assertEqual(logged["phase"], "report")
             self.assertEqual(logged["action"], "retry-stage")
 
+    def test_lark_card_bot_verifies_url_challenge_token(self) -> None:
+        import lark_card_bot
+
+        fake_config = types.SimpleNamespace(
+            feishu=types.SimpleNamespace(verification_token="secret-token"),
+        )
+        with patch.object(lark_card_bot, "get_config", lambda: fake_config):
+            status, data = lark_card_bot.handle_callback({
+                "type": "url_verification",
+                "token": "secret-token",
+                "challenge": "challenge-123",
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(data, {"challenge": "challenge-123"})
+
+            status, data = lark_card_bot.handle_callback({
+                "type": "url_verification",
+                "token": "wrong-token",
+                "challenge": "challenge-123",
+            })
+            self.assertEqual(status, 403)
+            self.assertIn("token", data["msg"])
+
+    def test_lark_card_bot_sdk_handles_url_verification(self) -> None:
+        import lark_card_bot
+
+        if lark_card_bot.lark is None:
+            self.skipTest("lark-oapi is not installed")
+
+        fake_config = types.SimpleNamespace(
+            feishu=types.SimpleNamespace(
+                verification_token="secret-token",
+                encrypt_key="",
+            ),
+        )
+        body = json.dumps({
+            "type": "url_verification",
+            "token": "secret-token",
+            "challenge": "sdk-challenge",
+        }).encode("utf-8")
+
+        old_cache = dict(lark_card_bot._sdk_card_handler_cache)
+        try:
+            lark_card_bot._sdk_card_handler_cache = {"key": None, "handler": None}
+            with patch.object(lark_card_bot, "get_config", lambda: fake_config):
+                handler = lark_card_bot._sdk_card_handler()
+                response = handler.do(lark_card_bot._raw_request("/feishu/card", {}, body))
+        finally:
+            lark_card_bot._sdk_card_handler_cache = old_cache
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            json.loads(response.content.decode("utf-8")),
+            {"challenge": "sdk-challenge"},
+        )
+
+    def test_lark_card_bot_sdk_card_processor_writes_action_log(self) -> None:
+        import lark_card_bot
+
+        fake_card = types.SimpleNamespace(
+            open_id="ou_test",
+            user_id="user_test",
+            open_message_id="om_test",
+            open_chat_id="oc_test",
+            action=types.SimpleNamespace(
+                value={"command": "/keep", "trial_id": "trial_sdk"},
+                form_value={"suggestion": ""},
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "actions.jsonl"
+            with patch.object(lark_card_bot, "ACTION_LOG", log_path):
+                result = lark_card_bot._process_sdk_card(fake_card)
+
+            logged = json.loads(log_path.read_text(encoding="utf-8").strip())
+
+        self.assertEqual(logged["action"], "keep")
+        self.assertEqual(logged["trial_id"], "trial_sdk")
+        self.assertEqual(logged["operator"]["open_id"], "ou_test")
+        self.assertIn("toast", result)
+
+    def test_card_server_writes_review_event_contract(self) -> None:
+        import card_server
+        import lark_notify
+        from lark_notify import wait_for_review_event
+
+        payload = {
+            "token": "secret-token",
+            "action": {
+                "value": {"command": "/revise", "trial_id": "trial_007"},
+                "form_value": {"suggestion": "调小校准强度"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "feishu_card_actions.jsonl"
+            old_queue = card_server.DecisionQueue
+            old_log = lark_notify.CARD_ACTION_LOG
+            try:
+                card_server.DecisionQueue = card_server._DecisionQueue(log_path)
+                lark_notify.CARD_ACTION_LOG = log_path
+
+                status, data = card_server.handle_callback(payload, "secret-token")
+                self.assertEqual(status, 200)
+                self.assertIn("toast", data)
+
+                logged = json.loads(log_path.read_text(encoding="utf-8").strip())
+                self.assertEqual(logged["action"], "rollback")
+                self.assertEqual(logged["trial_id"], "trial_007")
+                self.assertEqual(logged["supplement"], "调小校准强度")
+                self.assertIn("received_at", logged)
+
+                with patch("lark_notify.poll_recent_messages", return_value=[]):
+                    event = wait_for_review_event(
+                        "oc_test",
+                        "trial_007",
+                        timeout=0.2,
+                        poll_interval=0.05,
+                    )
+            finally:
+                card_server.DecisionQueue = old_queue
+                lark_notify.CARD_ACTION_LOG = old_log
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["source"], "card")
+        self.assertEqual(event["command"]["action"], "rollback")
+        self.assertEqual(event["command"]["supplement"], "调小校准强度")
+
     def test_loop_recovers_interrupted_stage_without_training(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

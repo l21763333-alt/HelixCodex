@@ -13,11 +13,11 @@ class FakeBaselineGitMcp:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
-    def create_model_trial_branch(self, trial_id: str) -> dict:
+    def create_model_trial_branch(self, trial_id: str, **kwargs) -> dict:
         self.calls.append(("branch", trial_id))
         return {"branch": f"model-exp/{trial_id}"}
 
-    def sync_remote_base(self, remote: str, base_branch: str) -> dict:
+    def sync_remote_base(self, remote: str, base_branch: str, **kwargs) -> dict:
         self.calls.append(("sync", f"{remote}/{base_branch}"))
         return {
             "synced": True,
@@ -29,11 +29,11 @@ class FakeBaselineGitMcp:
             "branch_after": base_branch,
         }
 
-    def snapshot_baseline_model(self, trial_id: str) -> dict:
+    def snapshot_baseline_model(self, trial_id: str, **kwargs) -> dict:
         self.calls.append(("snapshot", trial_id))
         return {"snapshot_path": f"/fake/snapshots/{trial_id}"}
 
-    def diff_trial_model_code(self, trial_code_dir: Path) -> dict:
+    def diff_trial_model_code(self, trial_code_dir: Path, **kwargs) -> dict:
         self.calls.append(("diff", trial_code_dir.as_posix()))
         return {
             "changed": 1,
@@ -42,7 +42,7 @@ class FakeBaselineGitMcp:
             "summary": "M src/model.py",
         }
 
-    def apply_trial_to_baseline(self, trial_code_dir: Path, trial_id: str) -> dict:
+    def apply_trial_to_baseline(self, trial_code_dir: Path, trial_id: str, **kwargs) -> dict:
         self.calls.append(("apply", trial_id))
         return {"trial_id": trial_id, "trial_code_dir": str(trial_code_dir)}
 
@@ -52,23 +52,24 @@ class FakeBaselineGitMcp:
         metrics: dict,
         report_path: str,
         supplement: str | None,
+        **kwargs,
     ) -> dict:
         self.calls.append(("commit", trial_id))
         return {"committed": True, "trial_id": trial_id, "commit": "fake-sha"}
 
-    def push_model_trial_branch(self, branch: str, remote: str, target_branch: str | None = None) -> dict:
+    def push_model_trial_branch(self, branch: str, remote: str, target_branch: str | None = None, **kwargs) -> dict:
         self.calls.append(("push", target_branch or branch))
         return {"pushed": True, "branch": branch, "remote": remote, "target_branch": target_branch or branch}
 
-    def create_model_pr(self, branch: str, base: str, body: str, title: str, draft: bool) -> dict:
+    def create_model_pr(self, branch: str, base: str, body: str, title: str, draft: bool, **kwargs) -> dict:
         self.calls.append(("pr", branch))
         return {"created": False, "branch": branch, "base": base, "draft_path": "/fake/pr.md"}
 
-    def get_model_repo_state(self) -> dict:
+    def get_model_repo_state(self, **kwargs) -> dict:
         self.calls.append(("state", ""))
         return {"branch": "model-exp/fake", "head": "fake-sha", "model_dirty": False}
 
-    def discard_unaccepted_model_changes(self, trial_id: str) -> dict:
+    def discard_unaccepted_model_changes(self, trial_id: str, **kwargs) -> dict:
         self.calls.append(("discard", trial_id))
         return {"trial_id": trial_id, "discarded_tracked": True}
 

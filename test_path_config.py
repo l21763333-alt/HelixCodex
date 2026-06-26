@@ -40,7 +40,7 @@ trial:
             self.assertEqual(registry.cfg.data.primary, "D:/local/data.csv")
             self.assertEqual(registry.cfg.trial.code_dir, "candidate/code")
             self.assertEqual(registry.cfg.trial.outputs_dir, "outputs/test_outputs")
-            self.assertTrue(str(registry.trial_code_dir("runs/001/trial_001")).endswith("candidate\\code"))
+            self.assertEqual(registry.trial_code_dir("runs/001/trial_001").parts[-2:], ("candidate", "code"))
 
     def test_feishu_credentials_only_load_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

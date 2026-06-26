@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 
 from openai_codex.client import CodexConfig
 
@@ -35,6 +35,7 @@ class FeishuConfig:
     chat_id: str = ""
     poll_interval: int = 5
     verification_token: str = ""
+    encrypt_key: str = ""
 
 
 @dataclass
@@ -243,11 +244,32 @@ class LarkMcpConfig:
 
 
 @dataclass
+class GitRepositoryConfig:
+    repo_id: str = "default"
+    repo_path: str = ""
+    baseline_dir: str = ""
+    source_dir: str = ""
+    requirements: str = ""
+    allowed_paths: list[str] = field(default_factory=list)
+    trial_code_subdir: str = ""
+    branch_prefix: str = ""
+    remote: str = ""
+    base_branch: str = ""
+    push_target_branch: str = ""
+    push_on_keep: bool | None = None
+    create_pr_on_keep: bool | None = None
+    pr_draft: bool | None = None
+
+
+@dataclass
 class GitMcpConfig:
     enabled: bool = True
     scope: str = "baseline_model"
+    active_repo: str = "default"
     repo_path: str = "."
     baseline_dir: str = "baseline"
+    source_dir: str = ""
+    requirements: str = ""
     allowed_paths: list[str] = field(default_factory=lambda: [
         "baseline/src/**",
         "baseline/requirements.txt",
@@ -271,6 +293,54 @@ class GitMcpConfig:
     require_human_approval_for_push: bool = True
     allow_force_push: bool = False
     allow_reset_hard: bool = False
+    repositories: dict[str, GitRepositoryConfig] = field(default_factory=dict)
+
+    def resolve_repo(self, repo_id: str | None = None) -> GitRepositoryConfig:
+        target_id = repo_id or self.active_repo or "default"
+        repo: GitRepositoryConfig | None = None
+
+        if self.repositories:
+            if target_id in self.repositories:
+                repo = _coerce_git_repo_config(target_id, self.repositories[target_id])
+            elif repo_id is None and len(self.repositories) == 1:
+                target_id, raw_repo = next(iter(self.repositories.items()))
+                repo = _coerce_git_repo_config(target_id, raw_repo)
+            else:
+                known = ", ".join(sorted(self.repositories))
+                raise ValueError(f"unknown Git MCP repo_id {target_id!r}; known repositories: {known}")
+        else:
+            repo = GitRepositoryConfig(repo_id=target_id)
+
+        baseline_dir = repo.baseline_dir or self.baseline_dir
+        source_dir = repo.source_dir or self.source_dir or str(Path(baseline_dir) / "src")
+        requirements = repo.requirements or self.requirements or str(Path(baseline_dir) / "requirements.txt")
+        repo_has_layout = bool(repo.baseline_dir or repo.source_dir or repo.requirements)
+        if repo.allowed_paths:
+            allowed_paths = list(repo.allowed_paths)
+        elif self.repositories and repo_has_layout:
+            allowed_paths = [f"{source_dir.rstrip('/')}/**", requirements]
+        else:
+            allowed_paths = list(self.allowed_paths)
+        return GitRepositoryConfig(
+            repo_id=target_id,
+            repo_path=repo.repo_path or self.repo_path,
+            baseline_dir=baseline_dir,
+            source_dir=source_dir,
+            requirements=requirements,
+            allowed_paths=allowed_paths,
+            trial_code_subdir=repo.trial_code_subdir or self.trial_code_subdir,
+            branch_prefix=repo.branch_prefix or self.branch_prefix,
+            remote=repo.remote or self.remote,
+            base_branch=repo.base_branch or self.base_branch,
+            push_target_branch=repo.push_target_branch or self.push_target_branch,
+            push_on_keep=repo.push_on_keep if repo.push_on_keep is not None else self.push_on_keep,
+            create_pr_on_keep=(
+                repo.create_pr_on_keep
+                if repo.create_pr_on_keep is not None
+                else self.create_pr_on_keep
+            ),
+            pr_draft=repo.pr_draft if repo.pr_draft is not None else self.pr_draft,
+        )
 
 
 @dataclass
@@ -330,6 +400,7 @@ ENV_OVERRIDES = {
     "FEISHU_APP_SECRET":   ("feishu", "app_secret"),
     "FEISHU_CHAT_ID":      ("feishu", "chat_id"),
     "FEISHU_VERIFICATION_TOKEN": ("feishu", "verification_token"),
+    "FEISHU_ENCRYPT_KEY":  ("feishu", "encrypt_key"),
     "OPENAI_API_KEY":      ("_top", "openai_api_key"),
     "CODEX_API_KEY":       ("_top", "codex_api_key"),
     "CODEX_HOME":          ("_top", "codex_home"),
@@ -372,6 +443,27 @@ def _apply_dataclass_section(target, data: dict) -> None:
     for key, value in data.items():
         if hasattr(target, key) and value is not None:
             setattr(target, key, value)
+
+
+def _coerce_git_repo_config(repo_id: str, data) -> GitRepositoryConfig:
+    if isinstance(data, GitRepositoryConfig):
+        if data.repo_id == repo_id:
+            return data
+        values = asdict(data)
+        values["repo_id"] = repo_id
+        return GitRepositoryConfig(**values)
+    if not isinstance(data, dict):
+        raise TypeError(f"Git MCP repository {repo_id!r} must be a mapping")
+    allowed = {field.name for field in dataclass_fields(GitRepositoryConfig)}
+    values = {key: value for key, value in data.items() if key in allowed and value is not None}
+    values["repo_id"] = repo_id
+    return GitRepositoryConfig(**values)
+
+
+def _coerce_git_repositories(data) -> dict[str, GitRepositoryConfig]:
+    if not isinstance(data, dict):
+        return {}
+    return {str(repo_id): _coerce_git_repo_config(str(repo_id), repo_cfg) for repo_id, repo_cfg in data.items()}
 
 
 def _flow_paths_from_dict(raw: dict) -> FlowPathsConfig:
@@ -455,15 +547,17 @@ def load_config(path: Path | str | None = None) -> Config:
         _apply_section(config.mcp, raw.get("mcp", {}), "lark",
                        ["enabled", "backend", "server_name"])
         _apply_section(config.mcp, raw.get("mcp", {}), "git",
-                       ["enabled", "scope", "repo_path", "baseline_dir",
-                        "allowed_paths", "trial_code_subdir", "branch_prefix",
+                       ["enabled", "scope", "active_repo", "repo_path", "baseline_dir",
+                        "source_dir", "requirements", "allowed_paths",
+                        "trial_code_subdir", "branch_prefix",
                         "remote", "base_branch",
                         "sync_on_loop_start", "sync_before_each_trial",
                         "publish_via_subagent", "push_on_keep",
                         "create_pr_on_keep", "pr_draft", "push_target_branch",
                         "server_transport", "server_command", "server_args",
                         "require_human_approval_for_push",
-                        "allow_force_push", "allow_reset_hard"])
+                        "allow_force_push", "allow_reset_hard", "repositories"])
+        config.mcp.git.repositories = _coerce_git_repositories(config.mcp.git.repositories)
 
     # 环境变量覆盖
     for env_var, (section, field) in ENV_OVERRIDES.items():

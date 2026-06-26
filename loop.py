@@ -89,8 +89,11 @@ class AIExperimentLoop:
         target_wape: float | None = None,
         human_review: bool | None = None,
         review_timeout: int | None = None,
+        model_repo: str | None = None,
     ):
         self.cfg = get_config()
+        self.git_repo_id = model_repo or self.cfg.mcp.git.active_repo or "default"
+        self.cfg.mcp.git.active_repo = self.git_repo_id
         loop_cfg = self.cfg.loop
 
         # ── 实验参数 ──
@@ -134,6 +137,9 @@ class AIExperimentLoop:
 
     def _git_trial_id(self, trial_id: str) -> str:
         return f"{self.run_label}_{trial_id}"
+
+    def _git_repo_cfg(self):
+        return self.cfg.mcp.git.resolve_repo(self.git_repo_id)
 
     def _rollback_key(self) -> str:
         return f"round_{self.round_num:03d}"
@@ -276,8 +282,14 @@ class AIExperimentLoop:
                     sync = self._sync_remote_base("before_trial")
                     if sync and not sync.get("ok", False):
                         return None
-                branch_info = baseline_git_mcp.create_model_trial_branch(git_trial_id)
-                snapshot = baseline_git_mcp.snapshot_baseline_model(git_trial_id)
+                branch_info = baseline_git_mcp.create_model_trial_branch(
+                    git_trial_id,
+                    repo_id=self.git_repo_id,
+                )
+                snapshot = baseline_git_mcp.snapshot_baseline_model(
+                    git_trial_id,
+                    repo_id=self.git_repo_id,
+                )
                 model_snapshot_path = snapshot["snapshot_path"]
                 self._trial_model_snapshots[git_trial_id] = model_snapshot_path
                 print(f"[Loop] Model branch: {branch_info['branch']}")
@@ -367,7 +379,8 @@ class AIExperimentLoop:
         if self._git_mcp_enabled():
             try:
                 diff = baseline_git_mcp.diff_trial_model_code(
-                    get_paths().existing_trial_code_dir(output_dir)
+                    get_paths().existing_trial_code_dir(output_dir),
+                    repo_id=self.git_repo_id,
                 )
                 model_diff_summary = diff.get("summary", "")
                 print(
@@ -451,12 +464,17 @@ class AIExperimentLoop:
             try:
                 trial_code_dir = get_paths().existing_trial_code_dir(result["output_dir"])
                 git_trial_id = result.get("git_trial_id", result["trial_id"])
-                baseline_git_mcp.apply_trial_to_baseline(trial_code_dir, git_trial_id)
+                baseline_git_mcp.apply_trial_to_baseline(
+                    trial_code_dir,
+                    git_trial_id,
+                    repo_id=self.git_repo_id,
+                )
                 commit = baseline_git_mcp.commit_baseline_model_update(
                     git_trial_id,
                     result.get("comparison", {}),
                     str(Path(result["output_dir"]) / "final_report.md"),
                     result.get("supplement"),
+                    repo_id=self.git_repo_id,
                 )
                 print(f"[Loop] Baseline model Git commit: {commit}")
                 self._publish_committed_keep(result, commit)
@@ -504,8 +522,15 @@ class AIExperimentLoop:
                 )
                 git_trial_id = result.get("git_trial_id", result["trial_id"])
                 if snapshot_path:
-                    baseline_git_mcp.restore_baseline_model_snapshot(snapshot_path, git_trial_id)
-                baseline_git_mcp.discard_unaccepted_model_changes(git_trial_id)
+                    baseline_git_mcp.restore_baseline_model_snapshot(
+                        snapshot_path,
+                        git_trial_id,
+                        repo_id=self.git_repo_id,
+                    )
+                baseline_git_mcp.discard_unaccepted_model_changes(
+                    git_trial_id,
+                    repo_id=self.git_repo_id,
+                )
             except Exception as e:
                 print(f"[Loop] Git MCP reverse restore failed: {e}")
                 notify_error(str(e), f"Git MCP reverse {result['trial_id']}")
@@ -558,7 +583,8 @@ class AIExperimentLoop:
         if self._git_mcp_enabled():
             try:
                 baseline_git_mcp.discard_unaccepted_model_changes(
-                    result.get("git_trial_id", trial_id)
+                    result.get("git_trial_id", trial_id),
+                    repo_id=self.git_repo_id,
                 )
             except Exception as e:
                 print(f"[Loop] Git MCP rollback discard failed: {e}")
@@ -643,22 +669,24 @@ class AIExperimentLoop:
                 "sync": {
                     "synced": False,
                     "reason": "skip sync while resuming an existing keep chain",
-                    "remote": self.cfg.mcp.git.remote,
-                    "base_branch": self.cfg.mcp.git.base_branch,
+                    "remote": self._git_repo_cfg().remote,
+                    "base_branch": self._git_repo_cfg().base_branch,
                 },
             }
             notify_git_sync_result(result)
             return result
+        repo_cfg = self._git_repo_cfg()
         try:
             if self.cfg.mcp.git.publish_via_subagent and git_subagent is not None:
                 try:
-                    result = git_subagent.sync_remote_base_via_subagent()
+                    result = git_subagent.sync_remote_base_via_subagent(repo_id=self.git_repo_id)
                 except Exception as subagent_error:
                     if not hasattr(baseline_git_mcp, "sync_remote_base"):
                         raise
                     sync = baseline_git_mcp.sync_remote_base(
-                        self.cfg.mcp.git.remote,
-                        self.cfg.mcp.git.base_branch,
+                        repo_cfg.remote,
+                        repo_cfg.base_branch,
+                        repo_id=self.git_repo_id,
                     )
                     result = {
                         "ok": bool(sync.get("synced")) and not sync.get("blocked"),
@@ -668,8 +696,9 @@ class AIExperimentLoop:
                     }
             else:
                 sync = baseline_git_mcp.sync_remote_base(
-                    self.cfg.mcp.git.remote,
-                    self.cfg.mcp.git.base_branch,
+                    repo_cfg.remote,
+                    repo_cfg.base_branch,
+                    repo_id=self.git_repo_id,
                 )
                 result = {"ok": bool(sync.get("synced")) and not sync.get("blocked"), "sync": sync}
         except Exception as e:
@@ -698,7 +727,8 @@ class AIExperimentLoop:
             return
 
         git_trial_id = result.get("git_trial_id", result["trial_id"])
-        branch = f"{self.cfg.mcp.git.branch_prefix}{git_trial_id}"
+        repo_cfg = self._git_repo_cfg()
+        branch = f"{repo_cfg.branch_prefix}{git_trial_id}"
         report_path = str(Path(result["output_dir"]) / "final_report.md")
         result_path = Path(result["output_dir"]) / "git_publish_result.json"
         try:
@@ -712,23 +742,26 @@ class AIExperimentLoop:
                         supplement=result.get("supplement"),
                         commit=commit,
                         result_path=result_path,
+                        repo_id=self.git_repo_id,
                     )
                 except Exception as subagent_error:
                     push = None
                     pr = None
-                    if self.cfg.mcp.git.push_on_keep:
+                    if repo_cfg.push_on_keep:
                         push = baseline_git_mcp.push_model_trial_branch(
                             branch=branch,
-                            remote=self.cfg.mcp.git.remote,
-                            target_branch=self.cfg.mcp.git.push_target_branch or None,
+                            remote=repo_cfg.remote,
+                            target_branch=repo_cfg.push_target_branch or None,
+                            repo_id=self.git_repo_id,
                         )
-                    if self.cfg.mcp.git.create_pr_on_keep:
+                    if repo_cfg.create_pr_on_keep:
                         pr = baseline_git_mcp.create_model_pr(
                             branch=branch,
-                            base=self.cfg.mcp.git.base_branch,
+                            base=repo_cfg.base_branch,
                             body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
                             title=f"forecast: keep {git_trial_id}",
-                            draft=self.cfg.mcp.git.pr_draft,
+                            draft=repo_cfg.pr_draft,
+                            repo_id=self.git_repo_id,
                         )
                     publish = {
                         "ok": True,
@@ -742,26 +775,28 @@ class AIExperimentLoop:
                             "push": push,
                             "pr": pr,
                         },
-                        "state": baseline_git_mcp.get_model_repo_state(),
+                        "state": baseline_git_mcp.get_model_repo_state(repo_id=self.git_repo_id),
                         "error": None,
                     }
                     result_path.write_text(json.dumps(publish, indent=2, ensure_ascii=False), encoding="utf-8")
             else:
                 push = None
                 pr = None
-                if self.cfg.mcp.git.push_on_keep:
+                if repo_cfg.push_on_keep:
                     push = baseline_git_mcp.push_model_trial_branch(
                         branch=branch,
-                        remote=self.cfg.mcp.git.remote,
-                        target_branch=self.cfg.mcp.git.push_target_branch or None,
+                        remote=repo_cfg.remote,
+                        target_branch=repo_cfg.push_target_branch or None,
+                        repo_id=self.git_repo_id,
                     )
-                if self.cfg.mcp.git.create_pr_on_keep:
+                if repo_cfg.create_pr_on_keep:
                     pr = baseline_git_mcp.create_model_pr(
                         branch=branch,
-                        base=self.cfg.mcp.git.base_branch,
+                        base=repo_cfg.base_branch,
                         body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
                         title=f"forecast: keep {git_trial_id}",
-                        draft=self.cfg.mcp.git.pr_draft,
+                        draft=repo_cfg.pr_draft,
+                        repo_id=self.git_repo_id,
                     )
                 publish = {
                     "ok": True,
@@ -773,7 +808,7 @@ class AIExperimentLoop:
                         "push": push,
                         "pr": pr,
                     },
-                    "state": baseline_git_mcp.get_model_repo_state(),
+                    "state": baseline_git_mcp.get_model_repo_state(repo_id=self.git_repo_id),
                     "error": None,
                 }
                 result_path.write_text(json.dumps(publish, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -900,6 +935,8 @@ class AIExperimentLoop:
         print(f"[Loop] 目标: {self.original_ask}")
         print(f"[Loop] 最大轮次: {self.max_iter}")
         print(f"[Loop] 人工审核: {'✅' if human_review_enabled() else '❌'}")
+        if self._git_mcp_enabled():
+            print(f"[Loop] Git MCP repo: {self.git_repo_id}")
         print(f"{'='*60}")
 
         hr_enabled = human_review_enabled()
@@ -1001,6 +1038,10 @@ def main():
         help="人工审核超时秒数 (覆盖 flow_config.yaml)",
     )
     parser.add_argument(
+        "--model-repo", type=str, default=None,
+        help="Git MCP 模型仓库 repo_id (覆盖 mcp.git.active_repo)",
+    )
+    parser.add_argument(
         "--config", type=str, default=None,
         help="指定 YAML 配置文件路径",
     )
@@ -1020,6 +1061,7 @@ def main():
         target_wape=args.target_wape,
         human_review=not args.no_review,
         review_timeout=args.review_timeout,
+        model_repo=args.model_repo,
     )
 
     # 执行

@@ -721,21 +721,41 @@ def _rel_to_trial(output_dir: str | Path, path: str | Path) -> str:
         return target.as_posix()
 
 
-def _configured_git_model_baseline_dir() -> Path | None:
-    """Return the Git MCP worktree baseline directory when it should seed trial code."""
+def _resolve_git_repo_path(repo_root: Path, value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = repo_root / path
+    return path.resolve()
+
+
+def _configured_git_model_paths() -> dict[str, Path] | None:
+    """Return active Git MCP model paths when they should seed trial code."""
     cfg = get_config().mcp.git
     if not cfg.enabled or cfg.scope != "baseline_model":
         return None
 
-    repo = Path(cfg.repo_path)
+    repo_cfg = cfg.resolve_repo()
+    repo = Path(repo_cfg.repo_path).expanduser()
     if not repo.is_absolute():
         repo = PROJECT_ROOT / repo
-    baseline = Path(cfg.baseline_dir)
-    source = baseline if baseline.is_absolute() else repo / baseline
-    source = source.resolve()
-    if (source / "src").exists() or (source / "requirements.txt").exists():
-        return source
+    repo = repo.resolve()
+    baseline = _resolve_git_repo_path(repo, repo_cfg.baseline_dir)
+    source = _resolve_git_repo_path(repo, repo_cfg.source_dir)
+    requirements = _resolve_git_repo_path(repo, repo_cfg.requirements)
+    if source.exists() or requirements.exists():
+        return {
+            "repo": repo,
+            "baseline": baseline,
+            "source": source,
+            "requirements": requirements,
+        }
     return None
+
+
+def _configured_git_model_baseline_dir() -> Path | None:
+    """Return the Git MCP worktree baseline directory when it should seed trial code."""
+    paths = _configured_git_model_paths()
+    return paths["baseline"] if paths else None
 
 
 def _initial_code_source_dir(experiment_dir: str | Path) -> Path:
@@ -745,9 +765,28 @@ def _initial_code_source_dir(experiment_dir: str | Path) -> Path:
 
 def copy_source_to_trial(experiment_dir: str, output_dir: str) -> list[str]:
     """将实验目录全部文件复制到 trial 目录, 返回复制的文件列表"""
-    src = Path(experiment_dir)
+    src = Path(experiment_dir).resolve()
     dst = _trial_code_dir(output_dir)
     dst.mkdir(parents=True, exist_ok=True)
+
+    git_paths = _configured_git_model_paths()
+    if git_paths and src == git_paths["baseline"]:
+        copied: list[str] = []
+        model_src = git_paths["source"]
+        if model_src.exists():
+            target_src = dst / "src"
+            shutil.copytree(
+                model_src,
+                target_src,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            copied.extend(str(p.relative_to(dst)) for p in target_src.rglob("*") if p.is_file())
+        model_req = git_paths["requirements"]
+        if model_req.exists():
+            shutil.copy2(model_req, dst / "requirements.txt")
+            copied.append("requirements.txt")
+        return sorted(copied)
 
     # 永远跳过的目录
     SKIP_PARTS = (
@@ -2524,6 +2563,7 @@ def main() -> int:
     parser.add_argument("--ask", default="分析预测误差，提出特征实验并验证", help="实验目标描述")
     parser.add_argument("--output", default="runs/trial_001", help="输出目录 (默认 runs/trial_001)")
     parser.add_argument("--previous-trial", default=None, help="继承上一轮 trial 的代码和指标 (链式优化)")
+    parser.add_argument("--model-repo", default=None, help="Git MCP 模型仓库 repo_id (覆盖 mcp.git.active_repo)")
 
     # 循环模式
     parser.add_argument("--loop", action="store_true", help="启用循环模式: 一次认证, 连续多轮实验")
@@ -2540,6 +2580,9 @@ def main() -> int:
     parser.add_argument("--review-timeout", type=int, default=1800, help="Human review 超时秒数 (默认 1800)")
 
     args = parser.parse_args()
+
+    if args.model_repo:
+        get_config().mcp.git.active_repo = args.model_repo
 
     try:
         # ── 循环模式 ──
