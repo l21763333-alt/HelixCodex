@@ -396,6 +396,8 @@ class AIExperimentLoop:
         print(f"[Loop] 自动决策: {auto_decision.upper()}")
 
         # ── 飞书人审 ──
+        human_decision = None
+        human_approved = False
         if human_review_enabled():
             print(f"[Loop] 等待飞书人工审核...")
             if self._lark_mcp_enabled():
@@ -416,6 +418,7 @@ class AIExperimentLoop:
                     auto_suggestion=auto_decision,
                 )
             decision = human_decision or auto_decision
+            human_approved = human_decision == "keep"
         else:
             decision = auto_decision
             supplement = None
@@ -424,6 +427,7 @@ class AIExperimentLoop:
 
         # ── 安全限制检查 ──
         decision = self._enforce_safety_limits(trial_id, decision)
+        human_approved = bool(human_approved and decision == "keep")
 
         # ── 保存 checkpoint ──
         code_dir = get_paths().existing_trial_code_dir(output_dir)
@@ -450,6 +454,7 @@ class AIExperimentLoop:
             "output_dir": output_dir,
             "comparison": comparison,
             "auto_decision": auto_decision,
+            "human_approved": human_approved,
             "model_snapshot_path": model_snapshot_path,
             "git_trial_id": git_trial_id,
         }
@@ -743,6 +748,7 @@ class AIExperimentLoop:
                         commit=commit,
                         result_path=result_path,
                         repo_id=self.git_repo_id,
+                        human_approved=bool(result.get("human_approved")),
                     )
                 except Exception as subagent_error:
                     push = None
@@ -753,16 +759,20 @@ class AIExperimentLoop:
                             remote=repo_cfg.remote,
                             target_branch=repo_cfg.push_target_branch or None,
                             repo_id=self.git_repo_id,
+                            human_approved=bool(result.get("human_approved")),
                         )
                     if repo_cfg.create_pr_on_keep:
-                        pr = baseline_git_mcp.create_model_pr(
-                            branch=branch,
-                            base=repo_cfg.base_branch,
-                            body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
-                            title=f"forecast: keep {git_trial_id}",
-                            draft=repo_cfg.pr_draft,
-                            repo_id=self.git_repo_id,
-                        )
+                        if self.cfg.mcp.git.require_human_approval_for_push and not result.get("human_approved"):
+                            pr = {"created": False, "blocked": True, "reason": "remote PR creation requires an explicit human KEEP approval"}
+                        else:
+                            pr = baseline_git_mcp.create_model_pr(
+                                branch=branch,
+                                base=repo_cfg.base_branch,
+                                body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
+                                title=f"forecast: keep {git_trial_id}",
+                                draft=repo_cfg.pr_draft,
+                                repo_id=self.git_repo_id,
+                            )
                     publish = {
                         "ok": True,
                         "operation": "publish_existing_keep",
@@ -788,16 +798,20 @@ class AIExperimentLoop:
                         remote=repo_cfg.remote,
                         target_branch=repo_cfg.push_target_branch or None,
                         repo_id=self.git_repo_id,
+                        human_approved=bool(result.get("human_approved")),
                     )
                 if repo_cfg.create_pr_on_keep:
-                    pr = baseline_git_mcp.create_model_pr(
-                        branch=branch,
-                        base=repo_cfg.base_branch,
-                        body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
-                        title=f"forecast: keep {git_trial_id}",
-                        draft=repo_cfg.pr_draft,
-                        repo_id=self.git_repo_id,
-                    )
+                    if self.cfg.mcp.git.require_human_approval_for_push and not result.get("human_approved"):
+                        pr = {"created": False, "blocked": True, "reason": "remote PR creation requires an explicit human KEEP approval"}
+                    else:
+                        pr = baseline_git_mcp.create_model_pr(
+                            branch=branch,
+                            base=repo_cfg.base_branch,
+                            body=json.dumps(result.get("comparison", {}), indent=2, ensure_ascii=False),
+                            title=f"forecast: keep {git_trial_id}",
+                            draft=repo_cfg.pr_draft,
+                            repo_id=self.git_repo_id,
+                        )
                 publish = {
                     "ok": True,
                     "operation": "publish_existing_keep",

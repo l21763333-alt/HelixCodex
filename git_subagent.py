@@ -48,7 +48,7 @@ def ensure_git_mcp_registered() -> dict[str, Any]:
 
     pattern = re.compile(
         r"\n?\[mcp_servers\.git_research\][\s\S]*?"
-        r"(?=\n\[mcp_servers\.|\n\[[^\]]+\]|\Z)"
+        r"(?=\n\[(?!mcp_servers\.git_research(?:\.|\]))[^\]]+\]|\Z)"
     )
     if pattern.search(text):
         new_text = pattern.sub("\n" + block.rstrip(), text).rstrip() + "\n"
@@ -137,6 +137,7 @@ def publish_keep_via_subagent(
     supplement: str | None = None,
     result_path: str | Path | None = None,
     repo_id: str | None = None,
+    human_approved: bool = True,
 ) -> dict[str, Any]:
     cfg = get_config().mcp.git
     repo_cfg = cfg.resolve_repo(repo_id)
@@ -154,9 +155,10 @@ Inputs:
 - supplement: {supplement!r}
 - push: {bool(repo_cfg.push_on_keep)}
 - create_pr: {bool(repo_cfg.create_pr_on_keep)}
+- human_approved: {bool(human_approved)}
 
 Required steps:
-1. Call publish_keep_result(repo_id={repo_cfg.repo_id!r}, trial_code_dir={str(trial_code_dir)!r}, trial_id={trial_id!r}, metrics=<metrics JSON>, report_path={str(report_path)!r}, supplement={supplement!r}, push={bool(repo_cfg.push_on_keep)}, create_pr={bool(repo_cfg.create_pr_on_keep)}).
+1. Call publish_keep_result(repo_id={repo_cfg.repo_id!r}, trial_code_dir={str(trial_code_dir)!r}, trial_id={trial_id!r}, metrics=<metrics JSON>, report_path={str(report_path)!r}, supplement={supplement!r}, push={bool(repo_cfg.push_on_keep)}, create_pr={bool(repo_cfg.create_pr_on_keep)}, human_approved={bool(human_approved)}).
 2. Call get_model_repo_state(repo_id={repo_cfg.repo_id!r}).
 3. Return JSON only:
 {{
@@ -168,7 +170,7 @@ Required steps:
   "error": null|string
 }}
 
-Do not call shell. Do not push main. Do not force push.
+Do not call shell. Do not push main. Do not force push. Do not push or create a remote PR when human_approved is false.
 """
     data = _run_git_subagent(prompt)
     if result_path:
@@ -188,6 +190,7 @@ def publish_existing_keep_via_subagent(
     commit: dict[str, Any] | None = None,
     result_path: str | Path | None = None,
     repo_id: str | None = None,
+    human_approved: bool = True,
 ) -> dict[str, Any]:
     cfg = get_config().mcp.git
     repo_cfg = cfg.resolve_repo(repo_id)
@@ -209,10 +212,11 @@ Inputs:
 - supplement: {supplement!r}
 - push: {bool(repo_cfg.push_on_keep)}
 - create_pr: {bool(repo_cfg.create_pr_on_keep)}
+- human_approved: {bool(human_approved)}
 
 Required steps:
-1. If push is true and commit.committed is true, call push_model_trial_branch(repo_id={repo_cfg.repo_id!r}, branch=branch, remote={repo_cfg.remote!r}, target_branch={target_branch!r}).
-2. If create_pr is true and commit.committed is true, call create_model_pr(repo_id={repo_cfg.repo_id!r}, branch=branch, base={repo_cfg.base_branch!r}, draft={bool(repo_cfg.pr_draft)}, title="forecast: keep {trial_id}", body=<metrics summary>).
+1. If push is true, commit.committed is true, and human_approved is true, call push_model_trial_branch(repo_id={repo_cfg.repo_id!r}, branch=branch, remote={repo_cfg.remote!r}, target_branch={target_branch!r}, human_approved={bool(human_approved)}). If human_approved is false, do not push remotely.
+2. If create_pr is true, commit.committed is true, and human_approved is true, call create_model_pr(repo_id={repo_cfg.repo_id!r}, branch=branch, base={repo_cfg.base_branch!r}, draft={bool(repo_cfg.pr_draft)}, title="forecast: keep {trial_id}", body=<metrics summary>).
 3. Call get_model_repo_state(repo_id={repo_cfg.repo_id!r}).
 4. Return JSON only:
 {{
@@ -230,7 +234,7 @@ Required steps:
   "error": null|string
 }}
 
-Do not call shell. Do not push main. Do not force push.
+Do not call shell. Do not push main. Do not force push. Do not push or create a remote PR when human_approved is false.
 """
     data = _run_git_subagent(prompt)
     if result_path:

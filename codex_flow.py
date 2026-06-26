@@ -6,7 +6,7 @@ codex_flow.py — ComboScope Codex 多线程工作流 (轻量版)
 
   T1: Evaluate + Diagnose (read_only) — 由 using-forecast skill 编排
   T2a: Plan (workspace_write) — 生成 experiment_plan + feature_hypothesis
-  [Python: copy source → agent2/code/]
+  [Python: copy source → candidate/code/]
   T2b: Code Generation (workspace_write) — 由 forecast-trial-codegen skill 驱动
   T3: Execute (Python 确定性) — 训练 + 评测 + keep/rollback
   T4: Report (workspace_write) — 由 forecast-report-writer skill 驱动
@@ -26,6 +26,7 @@ codex_flow.py — ComboScope Codex 多线程工作流 (轻量版)
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -159,7 +160,7 @@ def _ensure_session(codex: Codex) -> None:
         "[Auth] session 不可用。\n"
         "  设备码登录在 Codex SDK 中可能仅用于 ChatGPT 消费产品,\n"
         "  不适用于 Codex API。\n"
-        "  请在 codex_flow_config.json 中设置 openai_api_key"
+        "  请设置 OPENAI_API_KEY 或 flow_config.yaml 的 auth.openai_api_key"
     )
 
 
@@ -439,6 +440,8 @@ THREAD_CODEGEN = ThreadSpec(
 源码位置: {trial_code_dir}/  (只能修改此目录)
 实验计划: {output_dir}/agent1/experiment_plan.yaml
 特征假设: {output_dir}/agent1/feature_hypothesis.yaml
+模型接入契约:
+{model_contract}
 
 必须产出 (验证通过后):
   {trial_code_dir}/train.py
@@ -446,64 +449,26 @@ THREAD_CODEGEN = ThreadSpec(
 
 === 自验证流程 (MUST 按顺序执行) ===
 
-1. 生成 train.py, 按 experiment_plan.changes 逐条实现特征修改
-2. 语法检查: 执行 `python -m py_compile {trial_code_dir}/train.py`
-   失败 → 读错误 → 修复 → 重新执行直到通过 (最多 3 次)
-3. 冒烟测试: 执行以下脚本, 确认训练入口可调用:
-```bash
-cd {output_dir}
-python -c "
-import sys, os, pandas as pd
-sys.path.insert(0, r'{trial_code_dir}/src')
-from lgb_package_to_dish_online_0319 import run_online_pipeline, parse_args, apply_experiment_preset
-print('import OK')
-# 验证 args parse 正常
-parser = parse_args.__wrapped__ if hasattr(parse_args, '__wrapped__') else parse_args
-args = parser.parse_args(['--experiment', 'baseline', '--history_eval_only', '--output_dir', r'{trial_outputs_dir}', '--data_path', r'{data_path}', '--backtest_output_prefix', 'smoke_test'])
-args = apply_experiment_preset(args)
-print(f'args OK: experiment={{args.experiment}}, objective={{args.objective}}')
-```
-   失败 → 读错误 → 修复 train.py → 重新执行直到通过
-4. 只有以上验证全部通过, 才写入 agent2_execution_plan.yaml 并输出
+1. 读取模型接入契约，选择已有入口或生成薄封装 train.py；优先复用 entrypoint_candidates 和 default_train_command。
+2. 按 experiment_plan.changes 实现特征修改，修改范围只限 {trial_code_dir}/。
+3. 语法检查: 执行 `python -m py_compile {trial_code_dir}/train.py`。
+4. 冒烟检查: 至少验证 train.py 可导入或可执行帮助命令；如模型接入契约提供 entrypoint_candidates，需要验证所选入口存在且可导入或可被 train.py 调用。
+5. 只有验证全部通过，才写入 agent2_execution_plan.yaml。
 
-=== agent2_execution_plan.yaml 结构 ===
-```yaml
-agent: Agent2
-trial_id: {trial_id}
-source_entrypoint: "src/lgb_package_to_dish_online_0319.py"
-python_dependencies: ["src/util.py", "src/check_input.py"]
-train_command:
-  - "python"
-  - "{trial_code_dir}/train.py"
-  - "--experiment"
-  - "baseline"
-  - "--data_path"
-  - "{data_path}"
-  - "--output_dir"
-  - "{trial_outputs_dir}"
-  - "--history_eval_only"
-  - "--backtest_output_prefix"
-  - "{trial_id}"
-output_contract:
-  prediction_path: "{trial_id}_package_detail.csv"
-  actual_path: "{trial_id}_package_detail.csv"
-feature_changes:
-  - action: ...
-```
+=== agent2_execution_plan.yaml 要求 ===
 
-Runtime contract additions:
-- train_command must finish on the full --data_path within the T3 timeout.
-- --history_eval_only must be a bounded evaluation path, not an expensive full-table research training job.
-- package_detail output must contain split,true_pos_cnt,pred_pos_cnt for test rows.
-- Do not write the raw feature table as package_detail; output only metric contract columns needed by T3.
+- train_command 必须是 list，并使用契约中的占位符路径；不要写死本机绝对路径。
+- output_contract 必须来自模型接入契约；如需要覆盖预测文件名、真实值列、预测列、split 列或 split 过滤，只能写入明确字段。
+- source_entrypoint 必须是相对 {trial_code_dir}/ 的路径。
+- python_dependencies 只列真实存在的相对路径。
 
-硬约束:
-- 只在 {trial_code_dir}/ 下修改, 不访问 {experiment_dir}
-- 禁止在 {trial_code_dir}/ 下创建 data/、outputs/、logs/、__pycache__/；数据必须通过 --data_path={data_path} 读取
-- 验证未全部通过前, 不输出 agent2_execution_plan.yaml
-- pd.to_numeric() 默认返回值是标量 int, 链式 .fillna() 必崩
+运行时约束:
+- 训练命令必须在 T3 超时内完成。
+- 输出文件必须满足 output_contract 中的 prediction_path、split_column、split_filter、actual_column/prediction_column 或候选列规则。
+- 不要创建 data/、outputs/、logs/、__pycache__/ 到 {trial_code_dir}/ 下；数据通过 --data_path={data_path} 或契约指定参数读取。
 """,
 )
+
 
 # ── T4: Report ──
 # forecast-report-writer 的 SKILL.md 已定义报告的规则/结构/质量检查
@@ -530,7 +495,7 @@ THREAD_REPORT = ThreadSpec(
 - review_result.json 中的 decision 是确定性计算的, 报告中直接引用, 不可修改
 - 指标数值从 metric_comparison.json 读取, 不要手写
 - final_report.md 附录需列出: reports/forecast_report.md, agent1/experiment_plan.yaml,
-  agent2/agent2_execution_plan.yaml, agent2/code/train.py, evaluation/metric_comparison.json,
+  agent2/agent2_execution_plan.yaml, candidate/code/train.py, evaluation/metric_comparison.json,
   agent2/experiment_review.md, workflow_manifest.json
 """,
 )
@@ -728,7 +693,27 @@ def _resolve_git_repo_path(repo_root: Path, value: str | Path) -> Path:
     return path.resolve()
 
 
-def _configured_git_model_paths() -> dict[str, Path] | None:
+def _matches_copy_spec(rel: str, specs: list[str]) -> bool:
+    rel = rel.strip("/")
+    if not specs:
+        return True
+    for raw in specs:
+        spec = str(raw).strip().strip("/")
+        if not spec:
+            continue
+        if spec.endswith("/**"):
+            prefix = spec[:-3].strip("/")
+            if rel == prefix or rel.startswith(prefix + "/"):
+                return True
+            continue
+        if any(ch in spec for ch in "*?[") and fnmatch.fnmatch(rel, spec):
+            return True
+        if rel == spec or rel.startswith(spec + "/"):
+            return True
+    return False
+
+
+def _configured_git_model_paths() -> dict[str, Any] | None:
     """Return active Git MCP model paths when they should seed trial code."""
     cfg = get_config().mcp.git
     if not cfg.enabled or cfg.scope != "baseline_model":
@@ -739,15 +724,28 @@ def _configured_git_model_paths() -> dict[str, Path] | None:
     if not repo.is_absolute():
         repo = PROJECT_ROOT / repo
     repo = repo.resolve()
-    baseline = _resolve_git_repo_path(repo, repo_cfg.baseline_dir)
-    source = _resolve_git_repo_path(repo, repo_cfg.source_dir)
-    requirements = _resolve_git_repo_path(repo, repo_cfg.requirements)
-    if source.exists() or requirements.exists():
+    model_cfg = getattr(repo_cfg, "model", None)
+    model_root_value = getattr(model_cfg, "root", None) or getattr(repo_cfg, "baseline_dir", "baseline")
+    model_root = _resolve_git_repo_path(repo, model_root_value)
+    source = _resolve_git_repo_path(repo, getattr(repo_cfg, "source_dir", str(Path(model_root_value) / "src")))
+    requirements = _resolve_git_repo_path(repo, getattr(repo_cfg, "requirements", str(Path(model_root_value) / "requirements.txt")))
+    requirements_paths = [
+        model_root / item
+        for item in getattr(model_cfg, "requirements_paths", ["requirements.txt"])
+    ]
+    if model_root.exists():
         return {
             "repo": repo,
-            "baseline": baseline,
+            "baseline": model_root,
+            "model_root": model_root,
             "source": source,
             "requirements": requirements,
+            "requirements_paths": requirements_paths,
+            "copy_include": list(getattr(model_cfg, "copy_include", ["src/**", "requirements.txt", "train.py"])),
+            "copy_exclude": list(getattr(model_cfg, "copy_exclude", ["__pycache__/**", "*.pyc", ".git/**", "data/**", "outputs/**", "logs/**"])),
+            "entrypoint_candidates": list(getattr(model_cfg, "entrypoint_candidates", ["train.py", "src/train.py", "main.py"])),
+            "default_train_command": list(getattr(model_cfg, "default_train_command", [])),
+            "output_contract": dict(getattr(model_cfg, "output_contract", _default_output_contract())),
         }
     return None
 
@@ -763,8 +761,62 @@ def _initial_code_source_dir(experiment_dir: str | Path) -> Path:
     return _configured_git_model_baseline_dir() or Path(experiment_dir).resolve()
 
 
+def _active_model_contract() -> dict[str, Any]:
+    cfg = get_config().mcp.git
+    if cfg.enabled and cfg.scope == "baseline_model":
+        try:
+            repo_cfg = cfg.resolve_repo()
+            return {
+                "repo_id": repo_cfg.repo_id,
+                "model_root": repo_cfg.model.root,
+                "copy_include": list(repo_cfg.model.copy_include),
+                "copy_exclude": list(repo_cfg.model.copy_exclude),
+                "publish_paths": list(repo_cfg.model.publish_paths or repo_cfg.allowed_paths),
+                "requirements_paths": list(repo_cfg.model.requirements_paths),
+                "entrypoint_candidates": list(repo_cfg.model.entrypoint_candidates),
+                "default_train_command": list(repo_cfg.model.default_train_command),
+                "output_contract": dict(repo_cfg.model.output_contract),
+            }
+        except Exception as exc:
+            return {"error": f"model contract unavailable: {exc}"}
+    return {
+        "repo_id": "local_baseline",
+        "model_root": str(get_paths().cfg.roots.baseline),
+        "copy_include": ["src/**", "requirements.txt", "train.py"],
+        "copy_exclude": ["data/**", "outputs/**", "logs/**", "__pycache__/**", "*.pyc"],
+        "publish_paths": list(get_paths().cfg.model.publish_allowed_paths),
+        "requirements_paths": [get_paths().cfg.model.requirements],
+        "entrypoint_candidates": ["train.py", "src/train.py", "main.py"],
+        "default_train_command": [],
+        "output_contract": _default_output_contract(),
+    }
+
+
+def _default_output_contract() -> dict[str, Any]:
+    return {
+        "prediction_path": "{trial_id}_package_detail.csv",
+        "actual_path": "",
+        "split_column": "split",
+        "split_filter": "test",
+        "actual_column": "",
+        "prediction_column": "",
+        "actual_candidates": ["true_pos_cnt", "true_real_qty_sum", "actual", "y_true"],
+        "prediction_candidates": ["pred_pos_cnt", "pred_real_qty_sum", "prediction", "y_pred"],
+        "error_column": "",
+        "abs_error_column": "",
+        "baseline_prediction_globs": ["*_package_detail.csv", "*.csv"],
+        "secondary_metric_globs": ["*_store_dish_day.csv"],
+        "primary_level": "package_detail",
+        "secondary_level": "store_dish_day",
+    }
+
+
+def _model_contract_prompt() -> str:
+    return json.dumps(_active_model_contract(), indent=2, ensure_ascii=False)
+
+
 def copy_source_to_trial(experiment_dir: str, output_dir: str) -> list[str]:
-    """将实验目录全部文件复制到 trial 目录, 返回复制的文件列表"""
+    """将实验目录可执行源码复制到 trial 目录, 返回复制的文件列表"""
     src = Path(experiment_dir).resolve()
     dst = _trial_code_dir(output_dir)
     dst.mkdir(parents=True, exist_ok=True)
@@ -772,20 +824,24 @@ def copy_source_to_trial(experiment_dir: str, output_dir: str) -> list[str]:
     git_paths = _configured_git_model_paths()
     if git_paths and src == git_paths["baseline"]:
         copied: list[str] = []
-        model_src = git_paths["source"]
-        if model_src.exists():
-            target_src = dst / "src"
-            shutil.copytree(
-                model_src,
-                target_src,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-            )
-            copied.extend(str(p.relative_to(dst)) for p in target_src.rglob("*") if p.is_file())
-        model_req = git_paths["requirements"]
-        if model_req.exists():
-            shutil.copy2(model_req, dst / "requirements.txt")
-            copied.append("requirements.txt")
+        include = list(git_paths.get("copy_include") or ["**"])
+        exclude = list(git_paths.get("copy_exclude") or [])
+        for f in src.rglob("*"):
+            if not f.is_file():
+                continue
+            if "__pycache__" in f.parts or f.suffix == ".pyc":
+                continue
+            rel = f.relative_to(src).as_posix()
+            if not _matches_copy_spec(rel, include):
+                continue
+            if _matches_copy_spec(rel, exclude):
+                continue
+            target = dst / rel
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, target)
+            copied.append(rel)
         return sorted(copied)
 
     # 永远跳过的目录
@@ -1067,6 +1123,7 @@ def run_codex_thread(
     trial_code_dir: str = "",
     legacy_trial_code_dir: str = "",
     trial_outputs_dir: str = "",
+    model_contract: str = "",
     max_attempts: int = 2,
     retry_delay_s: float = 15.0,
 ) -> str:
@@ -1081,6 +1138,7 @@ def run_codex_thread(
         trial_code_dir=trial_code_dir,
         legacy_trial_code_dir=legacy_trial_code_dir,
         trial_outputs_dir=trial_outputs_dir,
+        model_contract=model_contract,
     )
     inputs: list = [TextInput(text=prompt)] + _resolve_skill_inputs(spec.skills)
 
@@ -1168,8 +1226,43 @@ def _read_csv_header(csv_path: Path) -> list[str]:
             return []
 
 
-def _validate_t3_prediction_contract(csv_path: Path) -> None:
+def _output_contract(exec_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    contract = _default_output_contract()
+    active = _active_model_contract().get("output_contract", {})
+    if isinstance(active, dict):
+        contract.update({k: v for k, v in active.items() if v is not None})
+    plan_contract = (exec_plan or {}).get("output_contract", {})
+    if isinstance(plan_contract, dict):
+        contract.update({k: v for k, v in plan_contract.items() if v is not None})
+    return contract
+
+
+def _format_contract_value(value: Any, output: Path, trial_id: str) -> str:
+    return str(value or "").format(
+        output_dir=str(output),
+        trial_id=trial_id,
+        data_path=str(get_paths().data_primary()),
+        trial_code_dir=str(get_paths().trial_code_dir(output)),
+        trial_outputs_dir=str(get_paths().trial_outputs_dir(output)),
+        trial_standardized_dir=str(get_paths().trial_standardized_dir(output)),
+    )
+
+
+def _resolve_contract_path(value: Any, output: Path, trial_id: str, *, default_base: Path) -> Path:
+    formatted = _format_contract_value(value, output, trial_id)
+    path = Path(formatted)
+    if path.is_absolute():
+        return path.resolve()
+    normalized = formatted.replace("\\", "/")
+    for prefix in ("standardized/", "evaluation/", "outputs/", "agent2/", "candidate/"):
+        if normalized.startswith(prefix):
+            return (output / path).resolve()
+    return (default_base / path).resolve()
+
+
+def _validate_t3_prediction_contract(csv_path: Path, contract: dict[str, Any] | None = None) -> None:
     """Reject obviously invalid codegen outputs before expensive metric reads."""
+    contract = contract or _default_output_contract()
     if not csv_path.exists():
         raise PredictionContractError(f"prediction file does not exist: {csv_path}")
 
@@ -1183,39 +1276,50 @@ def _validate_t3_prediction_contract(csv_path: Path) -> None:
     columns = set(_read_csv_header(csv_path))
     if not columns:
         raise PredictionContractError(f"prediction file has no header: {csv_path}")
-    if "split" not in columns:
+
+    split_column = str(contract.get("split_column") or "split")
+    if split_column and split_column not in columns:
         raise PredictionContractError(
-            f"prediction output missing required split column; columns={sorted(columns)}"
+            f"prediction output missing required split column {split_column!r}; columns={sorted(columns)}"
         )
 
-    name = csv_path.name.lower()
-    package_detail_schemas = (
-        {"true_pos_cnt", "pred_pos_cnt"},
+    configured_actual = str(contract.get("actual_column") or "")
+    configured_prediction = str(contract.get("prediction_column") or "")
+    if configured_actual or configured_prediction:
+        missing = [col for col in (configured_actual, configured_prediction) if col and col not in columns]
+        if missing:
+            raise PredictionContractError(
+                f"prediction output missing configured metric columns {missing}; columns={sorted(columns)}"
+            )
+        if configured_actual and configured_prediction:
+            return
+
+    actual_candidates = [str(item) for item in contract.get("actual_candidates", []) if item]
+    prediction_candidates = [str(item) for item in contract.get("prediction_candidates", []) if item]
+    for actual_col in actual_candidates:
+        for pred_col in prediction_candidates:
+            if actual_col in columns and pred_col in columns:
+                return
+
+    error_col = str(contract.get("error_column") or "")
+    abs_error_col = str(contract.get("abs_error_column") or "")
+    if error_col and abs_error_col and error_col in columns and abs_error_col in columns:
+        if configured_actual and configured_actual in columns:
+            return
+        if any(actual_col in columns for actual_col in actual_candidates):
+            return
+
+    legacy_schemas = (
         {"true_pos_cnt", "error_pos_cnt", "abs_error_pos_cnt"},
-    )
-    store_dish_day_schemas = (
-        {"true_real_qty_sum", "pred_real_qty_sum"},
         {"true_real_qty_sum", "error", "abs_error"},
     )
-    generic_schemas = (
-        {"actual", "prediction"},
-        {"y_true", "y_pred"},
+    if any(schema.issubset(columns) for schema in legacy_schemas):
+        return
+
+    raise PredictionContractError(
+        "prediction output does not match output_contract metric columns; "
+        f"columns={sorted(columns)}, contract={contract}"
     )
-
-    if "package_detail" in name:
-        accepted = package_detail_schemas
-        expected = "split plus true_pos_cnt/pred_pos_cnt (or precomputed package_detail error columns)"
-    elif "store_dish_day" in name:
-        accepted = store_dish_day_schemas
-        expected = "split plus true_real_qty_sum/pred_real_qty_sum (or precomputed store_dish_day error columns)"
-    else:
-        accepted = package_detail_schemas + store_dish_day_schemas + generic_schemas
-        expected = "one T3 metric schema"
-
-    if not any(schema.issubset(columns) for schema in accepted):
-        raise PredictionContractError(
-            f"prediction output does not match {expected}; columns={sorted(columns)}"
-        )
 
 
 def _train_cmd_uses_history_eval_only(train_cmd: list[str]) -> bool:
@@ -1246,10 +1350,7 @@ def _source_files_for_history_eval_check(code_dir: Path, exec_plan: dict[str, An
     source_entrypoint = exec_plan.get("source_entrypoint")
     if source_entrypoint:
         candidates.append(code_dir / str(source_entrypoint))
-    candidates.extend([
-        code_dir / "src" / "lgb_package_to_dish_online_0319.py",
-        code_dir / "train.py",
-    ])
+    candidates.append(code_dir / "train.py")
 
     seen: set[Path] = set()
     existing: list[Path] = []
@@ -1374,56 +1475,72 @@ def _needs_codegen_retry(comparison: dict | None) -> bool:
     return comparison.get("primary", {}).get("new_wape", 999) == 999
 
 
-def _compute_wape_bias_from_csv(csv_path: Path, split_filter: str = "test") -> tuple[float, float, int]:
-    """从带 split 列的 prediction CSV 计算指定 split 的 WAPE 和 Bias.
-
-    支持列格式 (按优先级):
-    - package_detail: true_pos_cnt, pred_pos_cnt
-    - store_dish_day: true_real_qty_sum, pred_real_qty_sum
-    - 标准化: actual, prediction
-    - pre-computed: abs_error / abs_error_pos_cnt + 对应 true/error 列
-    """
+def _compute_wape_bias_from_csv(
+    csv_path: Path,
+    split_filter: str = "test",
+    contract: dict[str, Any] | None = None,
+) -> tuple[float, float, int]:
+    """从带 split 列的 prediction CSV 计算指定 split 的 WAPE 和 Bias."""
     import pandas as pd
+    contract = contract or _default_output_contract()
     df = pd.read_csv(csv_path)
 
-    if "split" in df.columns:
-        df = df[df["split"] == split_filter]
+    split_column = str(contract.get("split_column") or "split")
+    split_value = str(contract.get("split_filter") or split_filter)
+    if split_column and split_column in df.columns:
+        df = df[df[split_column] == split_value]
     if len(df) == 0:
-        raise ValueError(f"split='{split_filter}' 无数据")
+        raise ValueError(f"{split_column}='{split_value}' 无数据")
 
-    # 优先: package_detail 列名
-    if "true_pos_cnt" in df.columns and "pred_pos_cnt" in df.columns:
-        actual_col, pred_col = "true_pos_cnt", "pred_pos_cnt"
-    # store_dish_day 列名
-    elif "true_real_qty_sum" in df.columns and "pred_real_qty_sum" in df.columns:
-        actual_col, pred_col = "true_real_qty_sum", "pred_real_qty_sum"
-    # 通用列名
-    elif "actual" in df.columns and "prediction" in df.columns:
-        actual_col, pred_col = "actual", "prediction"
-    elif "y_true" in df.columns and "y_pred" in df.columns:
-        actual_col, pred_col = "y_true", "y_pred"
-    # 预计算列 (package_detail)
-    elif "abs_error_pos_cnt" in df.columns and "true_pos_cnt" in df.columns:
+    configured_actual = str(contract.get("actual_column") or "")
+    configured_prediction = str(contract.get("prediction_column") or "")
+    if configured_actual and configured_prediction and configured_actual in df.columns and configured_prediction in df.columns:
+        actual_col, pred_col = configured_actual, configured_prediction
+    else:
+        actual_col = pred_col = ""
+        actual_candidates = [str(item) for item in contract.get("actual_candidates", []) if item]
+        prediction_candidates = [str(item) for item in contract.get("prediction_candidates", []) if item]
+        for candidate_actual in actual_candidates:
+            for candidate_prediction in prediction_candidates:
+                if candidate_actual in df.columns and candidate_prediction in df.columns:
+                    actual_col, pred_col = candidate_actual, candidate_prediction
+                    break
+            if actual_col and pred_col:
+                break
+
+    if actual_col and pred_col:
+        errors = df[pred_col] - df[actual_col]
+        actual_sum = df[actual_col].sum()
+        wape = errors.abs().sum() / actual_sum if actual_sum != 0 else float("nan")
+        bias = errors.sum() / actual_sum if actual_sum != 0 else float("nan")
+        return float(wape), float(bias), len(df)
+
+    error_col = str(contract.get("error_column") or "")
+    abs_error_col = str(contract.get("abs_error_column") or "")
+    actual_for_error = configured_actual or next(
+        (str(item) for item in contract.get("actual_candidates", []) if str(item) in df.columns),
+        "",
+    )
+    if error_col and abs_error_col and actual_for_error and error_col in df.columns and abs_error_col in df.columns:
+        denom = df[actual_for_error].sum()
+        wape = df[abs_error_col].sum() / denom if denom != 0 else float("nan")
+        bias = df[error_col].sum() / denom if denom != 0 else float("nan")
+        return float(wape), float(bias), len(df)
+
+    if "abs_error_pos_cnt" in df.columns and "true_pos_cnt" in df.columns:
         wape = df["abs_error_pos_cnt"].sum() / df["true_pos_cnt"].sum()
         bias = df["error_pos_cnt"].sum() / df["true_pos_cnt"].sum()
         return float(wape), float(bias), len(df)
-    # 预计算列 (store_dish_day)
-    elif "abs_error" in df.columns and "true_real_qty_sum" in df.columns:
+    if "abs_error" in df.columns and "true_real_qty_sum" in df.columns:
         wape = df["abs_error"].sum() / df["true_real_qty_sum"].sum()
         bias = df["error"].sum() / df["true_real_qty_sum"].sum()
         return float(wape), float(bias), len(df)
-    else:
-        raise ValueError(f"无法识别列, 可用: {list(df.columns)}")
 
-    errors = df[pred_col] - df[actual_col]
-    actual_sum = df[actual_col].sum()
-    wape = errors.abs().sum() / actual_sum if actual_sum != 0 else float("nan")
-    bias = errors.sum() / actual_sum if actual_sum != 0 else float("nan")
-    return float(wape), float(bias), len(df)
+    raise ValueError(f"无法识别列, 可用: {list(df.columns)}, contract={contract}")
 
 
 def _resolve_train_command(train_cmd: list[Any], output: Path, trial_id: str) -> list[str]:
-    """Resolve execution-plan train command against the canonical agent2/code layout."""
+    """Resolve execution-plan train command against the canonical candidate/code layout."""
     paths = get_paths()
     resolved = [
         str(arg).format(
@@ -1527,8 +1644,8 @@ def _write_fallback_report(output_dir: str, error: str) -> None:
         "",
         "## 3. 辅助指标",
         "",
-        f"- store_dish_day baseline WAPE: {secondary.get('old_wape', 999):.4f}",
-        f"- store_dish_day baseline Bias: {secondary.get('old_bias', 0):+.4f}",
+        f"- {secondary.get('level', 'secondary')} baseline WAPE: {secondary.get('old_wape', 999):.4f}",
+        f"- {secondary.get('level', 'secondary')} baseline Bias: {secondary.get('old_bias', 0):+.4f}",
         "",
         "## 4. 执行状态",
         "",
@@ -1661,21 +1778,29 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     print(f"[T3] 训练 {'成功' if train_success else '失败'} (rc={train_result.returncode})")
     _stage_log(str(output), "execute", f"training finished rc={train_result.returncode}")
 
-    # ── 3. 运行评测 (固定路径: EVAL_CALCULATE_SCRIPT) ──
-    output_contract = exec_plan.get("output_contract", {})
-    prediction_path = (
-        _trial_outputs_dir(output) /
-        output_contract.get("prediction_path", "new_prediction.csv")
+    # ── 3. 运行评测 ──
+    output_contract = _output_contract(exec_plan)
+    prediction_path = _resolve_contract_path(
+        output_contract.get("prediction_path", "new_prediction.csv"),
+        output,
+        manifest.trial_id,
+        default_base=_trial_outputs_dir(output),
     )
-    actual_path = get_paths().trial_standardized_dir(output) / "standardized_actual.csv"
+    actual_contract_path = output_contract.get("actual_path")
+    actual_path = (
+        _resolve_contract_path(actual_contract_path, output, manifest.trial_id, default_base=_trial_outputs_dir(output))
+        if actual_contract_path
+        else get_paths().trial_standardized_dir(output) / "standardized_actual.csv"
+    )
+    split_filter = str(output_contract.get("split_filter") or "test")
 
     eval_success = False
     eval_error: str | None = None
     new_wape, new_bias, new_rows = 999.0, 0.0, 0  # 默认值: 训练失败时使用
     if train_success and prediction_path.exists():
         try:
-            _validate_t3_prediction_contract(prediction_path)
-            new_wape, new_bias, new_rows = _compute_wape_bias_from_csv(prediction_path, "test")
+            _validate_t3_prediction_contract(prediction_path, output_contract)
+            new_wape, new_bias, new_rows = _compute_wape_bias_from_csv(prediction_path, split_filter, output_contract)
             eval_success = True
             print(f"[T3] new test: WAPE={new_wape:.4f}, Bias={new_bias:+.4f}, rows={new_rows}")
             _stage_log(str(output), "execute", f"new test WAPE={new_wape:.4f} Bias={new_bias:+.4f} rows={new_rows}")
@@ -1749,15 +1874,13 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
             (
                 f"{eval_error}\n"
                 f"Prediction path: {prediction_path}\n"
+                f"Output contract: {json.dumps(output_contract, ensure_ascii=False)}\n"
                 "Codegen must repair the candidate code before retry.\n"
-                "When --history_eval_only is present, write the test split package_detail "
-                "contract and return before dish allocation / store_dish aggregation.\n"
-                "Do not call allocate_dish_prediction_by_target_date or write "
-                "store_dish_day in history_eval_only.\n"
+                "Write an output file that satisfies output_contract: split filtering plus "
+                "configured actual/prediction columns or accepted candidate columns.\n"
+                "Do not write the raw feature table as the evaluation output.\n"
                 "If this is a train_timeout, do not extend the timeout; implement a bounded "
-                "--history_eval_only path that finishes quickly on the full data reference.\n"
-                "For package_detail output, write split plus true_pos_cnt/pred_pos_cnt "
-                "(or true_pos_cnt/error_pos_cnt/abs_error_pos_cnt), not the raw feature table."
+                "evaluation path that finishes quickly on the full data reference."
             ),
         )
         (output / "evaluation" / "new_metrics.json").write_text(
@@ -1775,9 +1898,9 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
             encoding="utf-8",
         )
 
-    # ── 4. 读取 baseline 旧指标 (test 集, 直接从 outputs/ 原始文件) ──
-    # 优先 package_detail (模型主输出, test WAPE ~0.70),
-    # 同时读取 store_dish_day (dish 分配后, test WAPE ~0.49)
+    # ── 4. 读取 baseline 旧指标 (按 output_contract 从 outputs/ 选择候选) ──
+    primary_level = str(output_contract.get("primary_level") or "prediction")
+    secondary_level = str(output_contract.get("secondary_level") or "secondary")
     old_wape, old_bias, old_rows = 999.0, 0.0, 0
     old_wape_dish, old_bias_dish = 999.0, 0.0
 
@@ -1785,25 +1908,30 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
     metric_dir = Path(baseline_metric_dir) if baseline_metric_dir else Path(manifest.experiment_dir) / "outputs"
     print(f"[T3] 读取 baseline 指标: {metric_dir}")
 
-    # 主指标: package_detail
-    pkg_files = sorted(metric_dir.glob("*_package_detail.csv"))
-    if not pkg_files:
-        pkg_files = sorted(metric_dir.glob("*.csv"))  # fallback
+    # 主指标: output_contract 指定的 baseline 候选
+    pkg_files: list[Path] = []
+    for pattern in output_contract.get("baseline_prediction_globs", []) or ["*.csv"]:
+        pkg_files.extend(sorted(metric_dir.glob(str(pattern))))
+    # 去重且保持顺序
+    pkg_files = list(dict.fromkeys(pkg_files))
     if pkg_files:
         try:
-            old_wape, old_bias, old_rows = _compute_wape_bias_from_csv(pkg_files[0], "test")
-            print(f"[T3] baseline package_detail test: WAPE={old_wape:.4f}, Bias={old_bias:+.4f}, rows={old_rows}")
+            old_wape, old_bias, old_rows = _compute_wape_bias_from_csv(pkg_files[0], split_filter, output_contract)
+            print(f"[T3] baseline {primary_level} {split_filter}: WAPE={old_wape:.4f}, Bias={old_bias:+.4f}, rows={old_rows}")
         except Exception as e:
-            print(f"[T3] 警告: 读取 package_detail 失败 ({e})")
+            print(f"[T3] 警告: 读取 {primary_level} 失败 ({e})")
 
-    # 辅助指标: store_dish_day
-    dish_files = sorted(metric_dir.glob("*_store_dish_day.csv"))
+    # 辅助指标: output_contract 可选 secondary_metric_globs
+    dish_files: list[Path] = []
+    for pattern in output_contract.get("secondary_metric_globs", []) or []:
+        dish_files.extend(sorted(metric_dir.glob(str(pattern))))
+    dish_files = list(dict.fromkeys(dish_files))
     if dish_files:
         try:
-            old_wape_dish, old_bias_dish, _ = _compute_wape_bias_from_csv(dish_files[0], "test")
-            print(f"[T3] baseline store_dish_day test: WAPE={old_wape_dish:.4f}, Bias={old_bias_dish:+.4f}")
+            old_wape_dish, old_bias_dish, _ = _compute_wape_bias_from_csv(dish_files[0], split_filter, output_contract)
+            print(f"[T3] baseline {secondary_level} {split_filter}: WAPE={old_wape_dish:.4f}, Bias={old_bias_dish:+.4f}")
         except Exception as e:
-            print(f"[T3] 警告: 读取 store_dish_day 失败 ({e})")
+            print(f"[T3] 警告: 读取 {secondary_level} 失败 ({e})")
 
     # 回退: 如果 outputs/ 读取失败, 用 T1 标准化产物
     if old_wape == 999:
@@ -1843,20 +1971,20 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
 
     comparison = {
         "decision": decision,
-        "reason": (f"package_detail WAPE delta={wape_delta:.4f}, Bias delta={bias_delta:.4f}, "
+        "reason": (f"{primary_level} WAPE delta={wape_delta:.4f}, Bias delta={bias_delta:.4f}, "
                    f"train_ok={train_success}, eval_ok={eval_success}"),
         "wape_delta": wape_delta,
         "bias_delta": bias_delta,
         "eval_error": eval_error,
         "failure_type": failure_type,
         "primary": {
-            "level": "package_detail",
+            "level": primary_level,
             "old_wape": old_wape, "new_wape": new_wape,
             "old_bias": old_bias, "new_bias": new_bias,
             "old_rows": old_rows,
         },
         "secondary": {
-            "level": "store_dish_day",
+            "level": secondary_level,
             "old_wape": old_wape_dish, "old_bias": old_bias_dish,
         },
     }
@@ -1872,6 +2000,8 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
         "eval_error": eval_error,
         "failure_type": failure_type,
         "prediction_path": str(prediction_path),
+        "actual_path": str(actual_path),
+        "output_contract": output_contract,
         "train_log_path": str(get_paths().trial_logs_dir(output) / "train.log"),
     }
     (output / "agent2" / "run_status.json").write_text(
@@ -1913,11 +2043,11 @@ def execute_t3(manifest: WorkflowManifest, *, baseline_metric_dir: str | None = 
 
     print(
         f"\n[T3] 决策: {decision.upper()} | "
-        f"package_detail WAPE {old_wape:.4f}→{new_wape:.4f} ({wape_delta:+.4f}) | "
+        f"{primary_level} WAPE {old_wape:.4f}→{new_wape:.4f} ({wape_delta:+.4f}) | "
         f"Bias {old_bias:+.4f}→{new_bias:+.4f} ({bias_delta:+.4f})"
     )
     if old_wape_dish != 999:
-        print(f"[T3]     store_dish_day WAPE={old_wape_dish:.4f} (辅助参考)")
+        print(f"[T3]     {secondary_level} WAPE={old_wape_dish:.4f} (辅助参考)")
 
     _stage_log(
         str(output),
@@ -1949,7 +2079,7 @@ def run_workflow(
       → T3 (execute, Python) → T4 (report)
 
     链式执行: --experiment baseline --previous-trial runs/trial_N
-      - 代码从 previous_trial/agent2/code/ 继承 (保留 codegen 修改)
+      - 代码从 previous_trial candidate/code/ 继承 (保留 codegen 修改)
       - 数据始终从 experiment_dir/data/ 读取
       - baseline 指标从 previous_trial/outputs/ 读取
 
@@ -1984,7 +2114,7 @@ def run_workflow(
     manifest.paths = get_paths().manifest_summary(out_dir)
     manifest._write()
 
-    # 代码来源: 链式执行从上一轮 agent2/code/ 继承, 否则从 experiment_dir 复制
+    # 代码来源: 链式执行从上一轮 candidate/code/ 继承, 否则从 experiment_dir 复制
     code_src_dir = str(_existing_code_dir(prev_dir)) if is_chain else str(_initial_code_source_dir(exp_dir))
     # 数据目录始终指向原始 baseline
     data_dir = str(get_paths().abs(get_paths().cfg.data.root))
@@ -2003,6 +2133,7 @@ def run_workflow(
         trial_code_dir=str(_trial_code_dir(out_dir)),
         legacy_trial_code_dir=str(_legacy_code_dir(out_dir)),
         trial_outputs_dir=str(_trial_outputs_dir(out_dir)),
+        model_contract=_model_contract_prompt(),
         max_attempts=recovery_cfg.codex_max_attempts,
         retry_delay_s=float(recovery_cfg.retry_delay_seconds),
     )
@@ -2189,19 +2320,11 @@ def run_workflow(
                 break
 
             if attempt >= MAX_RETRIES:
-                # 终极回退: 用原始脚本 + baseline preset 直接跑
-                src_script = _existing_code_dir(output_dir) / "src" / "lgb_package_to_dish_online_0319.py"
-                if src_script.exists():
-                    print("[T3] 回退: 使用原始训练脚本 (baseline preset, 不依赖 codegen)")
-                    _stage_log(output_dir, "execute", "fallback original training script started")
-                    fallback_cmd = [
-                        sys.executable, str(src_script),
-                        "--experiment", "baseline",
-                        "--history_eval_only",
-                        "--data_path", str(get_paths().data_primary()),
-                        "--output_dir", str(_trial_outputs_dir(output_dir)),
-                        "--backtest_output_prefix", "fallback",
-                    ]
+                fallback_template = _active_model_contract().get("default_train_command", [])
+                if fallback_template:
+                    print("[T3] 回退: 使用模型契约 default_train_command")
+                    _stage_log(output_dir, "execute", "fallback default_train_command started")
+                    fallback_cmd = _resolve_train_command(list(fallback_template), output, "fallback")
                     try:
                         fb_result = subprocess.run(
                             fallback_cmd,
@@ -2220,20 +2343,24 @@ def run_workflow(
                     _stage_log(output_dir, "execute", f"fallback training finished rc={fb_result.returncode}")
                     train_log_path.write_text(
                         (train_log_path.read_text(encoding="utf-8") if train_log_path.exists() else "") +
-                        f"\n\n=== FALLBACK (原始脚本 baseline preset) ===\n"
+                        f"\n\n=== FALLBACK (model default_train_command) ===\n"
                         f"CMD: {' '.join(fallback_cmd)}\n"
                         f"RC: {fb_result.returncode}\n"
                         f"STDERR: {fb_result.stderr[-500:]}",
                         encoding="utf-8",
                     )
                     if fb_result.returncode == 0:
-                        print("[T3] 回退训练成功! 使用原始脚本输出计算指标")
-                        fb_pred = _trial_outputs_dir(output_dir) / "fallback_package_detail.csv"
+                        fb_pred = _resolve_contract_path(
+                            output_contract.get("prediction_path", "new_prediction.csv"),
+                            output,
+                            "fallback",
+                            default_base=_trial_outputs_dir(output),
+                        )
                         if fb_pred.exists():
                             try:
-                                fallback_wape, fallback_bias, fallback_rows = _compute_wape_bias_from_csv(fb_pred, "test")
-                                print(f"[T3] fallback test: WAPE={fallback_wape:.4f}, Bias={fallback_bias:+.4f}")
-                                _stage_log(output_dir, "execute", f"fallback test WAPE={fallback_wape:.4f} Bias={fallback_bias:+.4f}")
+                                fallback_wape, fallback_bias, fallback_rows = _compute_wape_bias_from_csv(fb_pred, split_filter, output_contract)
+                                print(f"[T3] fallback {primary_level}: WAPE={fallback_wape:.4f}, Bias={fallback_bias:+.4f}")
+                                _stage_log(output_dir, "execute", f"fallback WAPE={fallback_wape:.4f} Bias={fallback_bias:+.4f}")
                                 primary = comparison.setdefault("primary", {})
                                 primary["new_wape"] = fallback_wape
                                 primary["new_bias"] = fallback_bias
@@ -2243,12 +2370,14 @@ def run_workflow(
                                 comparison["decision"] = "keep" if keep else "rollback"
                                 comparison["wape_delta"] = wape_delta
                                 comparison["bias_delta"] = bias_delta
-                                comparison["reason"] = f"fallback 原始脚本: WAPE delta={wape_delta:.4f}"
+                                comparison["reason"] = f"fallback default_train_command: WAPE delta={wape_delta:.4f}"
                                 (Path(output_dir) / "evaluation" / "new_metrics.json").write_text(
-                                    json.dumps({"wape": fallback_wape, "bias": fallback_bias, "rows": fallback_rows, "source": "fallback_original_script"}, indent=2),
+                                    json.dumps({"wape": fallback_wape, "bias": fallback_bias, "rows": fallback_rows, "source": "fallback_default_train_command"}, indent=2),
                                     encoding="utf-8")
                             except Exception as fe:
                                 print(f"[T3] 回退指标计算失败: {fe}")
+                else:
+                    _stage_log(output_dir, "execute", "fallback skipped: no model default_train_command configured")
 
                 manifest.record("execute", "N/A (Python deterministic)", [
                     "agent2/run_status.json", "agent2/review_result.json",
@@ -2256,9 +2385,10 @@ def run_workflow(
                     "evaluation/metric_comparison.json", "logs/train.log",
                     "logs/stage_execute.log",
                 ])
-                print("[T3] 已达最大重试次数, 使用 baseline 指标生成报告")
+                print("[T3] 已达最大重试次数, 使用当前指标生成报告")
                 _stage_log(output_dir, "execute", "T3 reached max retries")
                 break
+
 
             # 读错误日志, 反馈给 codegen 线程修复
             error_text = ""
@@ -2278,16 +2408,10 @@ def run_workflow(
                 f"eval_error={eval_error}\n\n"
                 f"{error_text}\n\n"
                 "Repair guidance:\n"
-                "- If failure_type=history_eval_contract_error, fix this before any training: "
-                "when --history_eval_only is passed, write the test split package_detail "
-                "contract and return before dish allocation.\n"
-                "- In history_eval_only, do not call allocate_dish_prediction_by_target_date, "
-                "build_store_dish_day_output, or write *_store_dish_day.csv.\n"
-                "- For train_timeout, do not extend the timeout; implement a bounded "
-                "--history_eval_only path that finishes quickly on the full --data_path.\n"
-                "- Avoid expensive full-table/groupby training in history_eval_only.\n"
-                "- Write package_detail contract columns: split,true_pos_cnt,pred_pos_cnt "
-                "for a test split; do not write the raw feature table.\n"
+                f"- output_contract={json.dumps(output_contract, ensure_ascii=False)}\n"
+                "- Make train_command finish within the configured timeout on the full data reference.\n"
+                "- Write the configured prediction_path with the configured split and metric columns.\n"
+                "- Do not write the raw feature table as the evaluation output.\n"
             )
 
             fix_input = TextInput(text=(

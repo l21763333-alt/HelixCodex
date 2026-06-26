@@ -14,6 +14,7 @@ from codex_flow import (
     _resolve_train_command,
     _write_fallback_feishu_card,
     _write_fallback_report,
+    THREAD_CODEGEN,
 )
 from config import get_paths
 
@@ -122,6 +123,60 @@ class TrialCodeLayoutTest(unittest.TestCase):
                 "source = 'git'\n",
             )
             self.assertTrue((trial / "candidate" / "code" / "requirements.txt").exists())
+
+    def test_git_model_copy_allows_missing_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local_baseline = root / "Codex_flow" / "baseline"
+            git_model = root / "Model_worktree" / "pkg"
+            (local_baseline / "src").mkdir(parents=True)
+            git_model.mkdir(parents=True)
+            (git_model / "train.py").write_text("print('train')\n", encoding="utf-8")
+            (git_model / "feature.py").write_text("x = 1\n", encoding="utf-8")
+
+            fake_model = types.SimpleNamespace(
+                root="pkg",
+                requirements_paths=[],
+                copy_include=["**"],
+                copy_exclude=["__pycache__/**", "*.pyc"],
+                entrypoint_candidates=["train.py"],
+                default_train_command=[],
+                output_contract={},
+            )
+            fake_repo = types.SimpleNamespace(
+                repo_path="Model_worktree",
+                baseline_dir="pkg",
+                source_dir="pkg",
+                requirements="pkg/requirements.txt",
+                model=fake_model,
+            )
+            fake_git = types.SimpleNamespace(
+                enabled=True,
+                scope="baseline_model",
+                active_repo="default",
+                resolve_repo=lambda repo_id=None: fake_repo,
+            )
+            fake_config = types.SimpleNamespace(mcp=types.SimpleNamespace(git=fake_git))
+
+            with (
+                patch("codex_flow.PROJECT_ROOT", root),
+                patch("codex_flow.get_config", return_value=fake_config),
+            ):
+                source = _initial_code_source_dir(local_baseline)
+                trial = root / "trial_001"
+                copied = copy_source_to_trial(str(source), str(trial))
+
+            self.assertIn("train.py", [item.replace("\\", "/") for item in copied])
+            self.assertIn("feature.py", [item.replace("\\", "/") for item in copied])
+            self.assertFalse((trial / "candidate" / "code" / "requirements.txt").exists())
+
+    def test_codegen_prompt_uses_model_contract_not_fixed_forecast_entrypoint(self) -> None:
+        prompt = THREAD_CODEGEN.prompt
+        self.assertIn("{trial_code_dir}", prompt)
+        self.assertIn("{model_contract}", prompt)
+        self.assertNotIn("lgb_package_to_dish_online_0319.py", prompt)
+        self.assertNotIn("--history_eval_only", prompt)
+        self.assertNotIn("agent2/code", prompt)
 
     def test_data_refs_written_for_trial(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

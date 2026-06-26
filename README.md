@@ -20,13 +20,13 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-模型训练依赖由模型仓库自己的 `baseline/requirements.txt` 管理。若要真实执行 T3 训练，还需要安装模型依赖：
+模型训练依赖由模型仓库配置里的 `mcp.git.model.requirements_paths` 管理。该字段可以为空，也可以包含多个 requirements 文件；若要真实执行 T3 训练，需要按目标模型仓库安装对应依赖，例如：
 
 ```bash
-pip install -r ../ForecastModel_worktree/baseline/requirements.txt
+pip install -r ../SupplyChain_worktree/src/supply_chain/forecast/package_forecast/requirements.txt
 ```
 
-当前模型依赖通常包括 `pandas`、`numpy`、`scikit-learn`、`lightgbm`、`pyodps`。如果 Git MCP worktree 尚未准备好，也可先用本项目内的 `baseline/requirements.txt`。
+如果目标模型没有 requirements 文件，先确认训练入口的运行环境依赖已由镜像、虚拟环境或调度环境提供。
 
 ### 2. 配置 `flow_config.yaml`
 
@@ -50,26 +50,58 @@ mcp:
   git:
     enabled: true
     scope: "baseline_model"
-    repo_path: "../ForecastModel_worktree"
-    baseline_dir: "baseline"
-    allowed_paths:
-      - "baseline/src/**"
-      - "baseline/requirements.txt"
-    remote: "forecastops"
-    base_branch: "ForecastModel"
+    active_repo: "supply_chain_package_forecast"
+    repositories:
+      supply_chain_package_forecast:
+        repo:
+          path: "../SupplyChain_worktree"
+          url: "ssh://git@172.18.254.56:221/haidilao-algo/forecasting/supply_chain.git"
+          lifecycle: "clone_if_missing"   # 路径不存在时用 repo.url 自动 clone
+          remote: "origin"
+          base_branch: "develop"
+          sync_strategy: "ff_only"
+        model:
+          root: "src/supply_chain/forecast/package_forecast"
+          copy_include: ["**"]
+          copy_exclude: ["__pycache__/**", "*.pyc", ".git/**", "data/**", "outputs/**", "logs/**"]
+          publish_paths:
+            - "src/supply_chain/forecast/package_forecast/**"
+          requirements_paths:
+            - "requirements.txt"
+          entrypoint_candidates:
+            - "train.py"
+            - "main.py"
+            - "run.py"
+            - "scripts/train.py"
+          default_train_command: []
+          output_contract:
+            prediction_path: "{trial_id}_package_detail.csv"
+            split_column: "split"
+            split_filter: "test"
+            actual_candidates: ["true_pos_cnt", "true_real_qty_sum", "actual", "y_true"]
+            prediction_candidates: ["pred_pos_cnt", "pred_real_qty_sum", "prediction", "y_pred"]
+            baseline_prediction_globs: ["*_package_detail.csv", "*.csv"]
+            secondary_metric_globs: ["*_store_dish_day.csv"]
+        publish:
+          mode: "direct_branch"            # 或 branch_pr
+          branch_prefix: "model-exp/"
+          target_branch: "develop"
+          push_on_keep: true
+          create_pr: false
+          pr_draft: true
     sync_on_loop_start: true
     sync_before_each_trial: false
-    push_on_keep: true
-    push_target_branch: "ForecastModel"
     require_human_approval_for_push: true
 ```
 
 重点备注：
 
 - `paths.experiment_dir` 或命令行 `--experiment baseline` 指向本项目的实验 baseline，用于读取 `baseline/data` 和 `baseline/outputs`。
-- `mcp.git.repo_path + mcp.git.baseline_dir` 指向模型 Git worktree，默认是 `../ForecastModel_worktree/baseline`，T2 Copy 会优先从这里复制完整模型源码。
-- `allowed_paths` 是 Git MCP 发布边界，KEEP 时只允许写回 `baseline/src/**` 和 `baseline/requirements.txt`。
-- `push_on_keep: true` 会在 KEEP 后尝试提交/推送模型代码；生产环境建议保留 `require_human_approval_for_push: true`。
+- `mcp.git.repo.path + mcp.git.model.root` 指向模型 Git worktree 中的模型根目录；T2 Copy 会从这里按 `copy_include/copy_exclude` 复制源码到 `candidate/code/`。
+- `model.publish_paths` 是 Git MCP 发布边界，KEEP 时只允许把候选代码写回这些路径。
+- `output_contract` 是 T3 读取预测文件、split、真实值列、预测列和 baseline 指标文件的契约；新模型接入时必须优先补齐这里。
+- `repo.lifecycle` 当前示例使用 `clone_if_missing`；当 `repo.path` 不存在且提供 `repo.url` 时会尝试自动 clone。
+- `push_on_keep: true` 只表示允许发布；生产环境建议保留 `require_human_approval_for_push: true`，未经过人工 KEEP 时不会执行 remote push。
 
 ### 3. 配置 `flow_paths.yaml`
 
@@ -138,33 +170,32 @@ set +a
 
 ### 5. 准备模型 Git worktree
 
-默认配置要求模型仓库在项目同级目录：
+默认测试配置要求 supply_chain 模型仓库在项目同级目录，模型根目录由 `mcp.git.model.root` 指定：
 
 ```text
 /srv/codex/
   Codex_flow/
-  ForecastModel_worktree/
-    baseline/
-      src/
-      requirements.txt
+  SupplyChain_worktree/
+    src/supply_chain/forecast/package_forecast/
+      requirements.txt  # 可选，按 requirements_paths 配置
 ```
 
 如果还没有 worktree，先拉取或创建模型仓库目录，并确认远端名和分支与 `flow_config.yaml` 一致：
 
 ```bash
 cd /srv/codex
-git clone <ForecastModel 仓库地址> ForecastModel_worktree
-cd ForecastModel_worktree
+git clone ssh://git@172.18.254.56:221/haidilao-algo/forecasting/supply_chain.git SupplyChain_worktree
+cd SupplyChain_worktree
 git remote -v
-git checkout ForecastModel
-git pull forecastops ForecastModel
+git checkout develop
+git pull origin develop
 ```
 
-如果在 sandbox 或服务用户下手工执行 `git -C /srv/codex/ForecastModel_worktree ...` 遇到 `dubious ownership`，只读排查可用单次参数：
+如果在 sandbox 或服务用户下手工执行 `git -C /srv/codex/SupplyChain_worktree ...` 遇到 `dubious ownership`，只读排查可用单次参数：
 
 ```bash
-git -c safe.directory=/srv/codex/ForecastModel_worktree \
-  -C /srv/codex/ForecastModel_worktree \
+git -c safe.directory=/srv/codex/SupplyChain_worktree \
+  -C /srv/codex/SupplyChain_worktree \
   status --short --branch
 ```
 
@@ -203,13 +234,13 @@ python codex_flow.py \
   --output runs/trial_001
 ```
 
-多轮自动优化。Git MCP 启用时会在 loop 启动时同步 `mcp.git.repo_path` 指向的模型 worktree；飞书启用时会生成审核卡片并等待人工命令或超时：
+多轮自动优化。Git MCP 启用时会在 loop 启动时同步 `mcp.git.repo.path` 指向的模型 worktree，并只管理 `model.publish_paths`；飞书启用时会生成审核卡片并等待人工命令或超时：
 
 ```bash
 source venv/bin/activate
 python loop.py \
   --experiment baseline \
-  --ask "从 ForecastModel 分支同步 baseline 模型代码，基于当前 baseline 进行预测优化实验" \
+  --ask "从 supply_chain develop 分支同步 package_forecast 模型代码，基于当前配置进行预测优化实验" \
   --output runs/001 \
   --max-trials 3 \
   --review-timeout 6000
@@ -255,7 +286,7 @@ python codex_login.py --logout
 python codex_login.py
 
 # 3. 如启用 Git MCP，确认模型源码 worktree 已同步
-#    默认源码位置: ../ForecastModel_worktree/baseline/src
+#    默认源码位置: ../SupplyChain_worktree/src/supply_chain/forecast/package_forecast
 #    loop.py 启动时会按 flow_config.yaml 自动同步远端分支。
 
 # 4. 运行单次实验
@@ -338,13 +369,27 @@ Codex_flow/
 | --- | --- | --- | --- |
 | T1 | Evaluate | Codex | 扫描实验目录，标准化输入，定位 badcase，提出优化方向。禁止训练和修改模型代码。 |
 | T2a | Plan | Codex | 根据 T1 结果制定实验计划、特征假设和候选方案。 |
-| Copy | Code Snapshot | Python | 将允许范围内的模型代码复制到 `candidate/code/`。非链式 trial 在 Git MCP 启用时优先从 `mcp.git.repo_path` 下的 `baseline/` 复制源码；数据和历史输出只做引用。 |
-| T2b | Codegen | Codex | 生成候选训练代码，默认写入 `runs/<run>/trial_xxx/candidate/code/`。 |
-| T3 | Execute | Python | 执行训练/预测/评估，计算指标并生成 KEEP、ROLLBACK、REVERSE 或 STOP 建议。 |
+| Copy | Code Snapshot | Python | 从 `mcp.git.repo.path + model.root` 按 `copy_include/copy_exclude` 复制模型代码到 `candidate/code/`；数据和历史输出只做引用。 |
+| T2b | Codegen | Codex | 基于注入的 `model_contract` 生成或改造候选训练代码，默认写入 `runs/<run>/trial_xxx/candidate/code/`，并产出 `agent2_execution_plan.yaml`。 |
+| T3 | Execute | Python | 执行 `agent2_execution_plan.yaml` 中的 `train_command`，按 `output_contract` 读取预测文件、split、actual/prediction 列并计算指标。 |
 | T4 | Report | Codex | 生成中文实验报告。该阶段可降级，失败不会直接毁掉整轮实验。 |
 | T5 | Feishu Card | Codex/Python | 生成并发送飞书审核卡片。该阶段可降级，支持后续人工恢复。 |
 
-T3 是唯一真正执行训练和评估的阶段。日志中会明确出现 `[T3] 执行训练`，用于避免 T1/T2 阶段误跑长任务。
+T3 是唯一真正执行训练和评估的阶段。日志中会明确出现 `[T3] 执行训练`，用于避免 T1/T2 阶段误跑长任务。T1/T2 不应依赖固定模型入口；所有入口候选、训练命令和输出契约都来自 `model_contract`。
+
+最新执行链路：
+
+```text
+loop 启动
+  -> Git MCP 校验/同步 repo.path 的 worktree（当前 clone_if_missing + ff_only）
+  -> 每轮创建 trial 分支和模型快照
+  -> Copy: model.root 按 copy_include/copy_exclude 复制到 candidate/code/
+  -> T2b: Codex 基于 model_contract 生成 train.py + agent2_execution_plan.yaml
+  -> T3: Python 执行 train_command，并按 output_contract 评估 prediction/baseline
+  -> T4/T5: 生成报告和飞书审核卡片
+  -> KEEP: apply candidate/code 回 publish_paths，commit；人工 KEEP 通过后才 remote push/PR
+  -> ROLLBACK/REVERSE: 丢弃未接受改动或恢复模型快照
+```
 
 ## 数据与代码隔离
 
@@ -362,39 +407,37 @@ runs/<run>/trial_xxx/
 模型源码有两个不同角色的目录：
 
 ```text
-../ForecastModel_worktree/baseline/
-  src/                         # Git MCP 同步的模型源码，T2 Copy 的优先来源
-  requirements.txt
+../SupplyChain_worktree/
+  src/supply_chain/forecast/package_forecast/   # Git MCP model.root，T2 Copy 的优先来源
+    requirements.txt                            # 可选；也可由 requirements_paths 配置多个文件
 
 baseline/
-  data/                        # Codex Flow 固定数据源
-  outputs/                     # baseline 指标读取来源
+  data/                                        # Codex Flow 固定数据源
+  outputs/                                     # baseline 指标读取来源
 ```
 
-运行 `codex_flow.py --experiment baseline` 或 `loop.py --experiment baseline` 时，`--experiment` 仍指向当前项目的 `baseline/`，用于数据引用和 baseline outputs。候选模型代码的初始复制来源会按配置优先选择 `mcp.git.repo_path + mcp.git.baseline_dir`，默认即 `../ForecastModel_worktree/baseline/`；只有该 worktree 不存在或未包含 `src/requirements.txt` 时，才回退到 `--experiment` 目录。
+运行 `codex_flow.py --experiment baseline` 或 `loop.py --experiment baseline` 时，`--experiment` 仍指向当前项目的 `baseline/`，用于数据引用和 baseline outputs。候选模型代码的初始复制来源会按配置优先选择 `mcp.git.repo.path + mcp.git.model.root`；如果 Git MCP 未启用或该模型根目录不可用，才回退到 `--experiment` 目录。
 
 候选代码和有效模型代码严格隔离：
 
 ```text
-../ForecastModel_worktree/baseline/src/   # 当前有效模型代码的 Git MCP worktree 副本
-../ForecastModel_worktree/baseline/requirements.txt
+../SupplyChain_worktree/src/supply_chain/forecast/package_forecast/  # 当前有效模型代码
 
 runs/<run>/trial_xxx/
-  candidate/code/              # 当前 trial 候选代码
+  candidate/code/              # 当前 trial 候选代码，结构与 model.root 同构
   outputs/real_outputs/        # 当前 trial 输出
   evaluation/                  # 当前 trial 指标
   reports/                     # 当前 trial 报告
   logs/                        # 当前 trial 日志
 ```
 
-KEEP 发布时只允许将候选代码应用回 Git MCP worktree 内的模型 baseline：
+KEEP 发布时只允许将候选代码应用回 Git MCP worktree 内的 `model.publish_paths`：
 
 ```text
-baseline/src/**
-baseline/requirements.txt
+src/supply_chain/forecast/package_forecast/**
 ```
 
-以上路径相对于 `mcp.git.repo_path`，默认是 `../ForecastModel_worktree/`。数据、日志、训练输出和报告不会进入模型发布路径。
+以上路径相对于 `mcp.git.repo.path`。数据、日志、训练输出和报告不会进入模型发布路径。
 
 ## 配置文件
 
@@ -427,17 +470,44 @@ mcp:
   git:
     enabled: true
     scope: "baseline_model"
-    repo_path: "../ForecastModel_worktree"
-    baseline_dir: "baseline"
-    trial_code_subdir: "candidate/code"
-    remote: "forecastops"
-    base_branch: "ForecastModel"
-    allowed_paths:
-      - "baseline/src/**"
-      - "baseline/requirements.txt"
+    active_repo: "supply_chain_package_forecast"
+    repositories:
+      supply_chain_package_forecast:
+        repo:
+          path: "../SupplyChain_worktree"
+          url: "ssh://git@172.18.254.56:221/haidilao-algo/forecasting/supply_chain.git"
+          lifecycle: "clone_if_missing"
+          remote: "origin"
+          base_branch: "develop"
+          sync_strategy: "ff_only"
+        model:
+          root: "src/supply_chain/forecast/package_forecast"
+          copy_include: ["**"]
+          copy_exclude: ["__pycache__/**", "*.pyc", ".git/**", "data/**", "outputs/**", "logs/**"]
+          publish_paths:
+            - "src/supply_chain/forecast/package_forecast/**"
+          requirements_paths:
+            - "requirements.txt"
+          entrypoint_candidates: ["train.py", "main.py", "run.py", "scripts/train.py"]
+          default_train_command: []
+          output_contract:
+            prediction_path: "{trial_id}_package_detail.csv"
+            split_column: "split"
+            split_filter: "test"
+            actual_candidates: ["true_pos_cnt", "true_real_qty_sum", "actual", "y_true"]
+            prediction_candidates: ["pred_pos_cnt", "pred_real_qty_sum", "prediction", "y_pred"]
+            baseline_prediction_globs: ["*_package_detail.csv", "*.csv"]
+            secondary_metric_globs: ["*_store_dish_day.csv"]
+        publish:
+          mode: "direct_branch"
+          branch_prefix: "model-exp/"
+          target_branch: "develop"
+          push_on_keep: true
+          create_pr: false
+          pr_draft: true
 ```
 
-`mcp.git.repo_path` 指向真正的模型 Git worktree。loop 启动同步远端后，非链式 trial 的 Copy 阶段会优先从 `{repo_path}/{baseline_dir}` 复制模型源码到 `runs/<run>/trial_xxx/candidate/code/`；`paths.experiment_dir` 或 CLI 的 `--experiment baseline` 仍用于读取本项目内的数据和 baseline outputs。
+`mcp.git.repo.path` 指向真正的模型 Git worktree。loop 启动同步远端后，非链式 trial 的 Copy 阶段会优先从 `{repo.path}/{model.root}` 按 `copy_include/copy_exclude` 复制模型源码到 `runs/<run>/trial_xxx/candidate/code/`；`paths.experiment_dir` 或 CLI 的 `--experiment baseline` 仍用于读取本项目内的数据和 baseline outputs。
 
 `flow_paths.yaml` 负责路径契约，例如固定数据源、trial 子目录、全局日志和快照目录。需要本机覆盖时可创建 `flow_paths.local.yaml`，该文件不应提交。
 
@@ -466,7 +536,7 @@ python codex_flow.py \
   --output runs/trial_001
 ```
 
-当 Git MCP 启用且 `../ForecastModel_worktree/baseline` 存在时，上述单次实验的 T2 Copy 阶段会从该 Git worktree 复制模型源码；`--experiment baseline` 继续用于数据源和 baseline outputs。
+当 Git MCP 启用且 `repo.path + model.root` 存在时，上述单次实验的 Copy 阶段会从该 Git worktree 复制模型源码；`--experiment baseline` 继续用于数据源和 baseline outputs。
 
 ### 链式实验
 
@@ -491,7 +561,7 @@ python loop.py \
   --target-wape 0.55
 ```
 
-多轮 loop 启动时会按 `flow_config.yaml` 的 Git MCP 配置同步 `repo_path` 指向的模型 worktree。每个非链式 trial 从该 worktree 初始化 `candidate/code/`；ROLLBACK 不发布，KEEP 才会把候选模型代码应用回同一个 Git worktree 并按配置提交/推送。
+多轮 loop 启动时会按 `flow_config.yaml` 的 Git MCP 配置同步 `repo.path` 指向的模型 worktree。每个非链式 trial 从 `{repo.path}/{model.root}` 初始化 `candidate/code/`；ROLLBACK 不发布，KEEP 才会把候选模型代码应用回同一个 Git worktree 的 `publish_paths` 并按配置提交。若开启 `require_human_approval_for_push`，只有人工 KEEP 才允许 remote push/PR。
 
 ### 关闭人工审核
 
@@ -556,32 +626,33 @@ runs/feishu_card_actions.jsonl
 
 ## Git MCP 发布边界
 
-KEEP 后可通过 `git_subagent.py` 和 `mcp_servers/git_research_server/` 发布模型代码。Git 工具被限制在模型发布边界内：
+KEEP 后可通过 `git_subagent.py` 和 `mcp_servers/git_research_server/` 发布模型代码。Git 工具被限制在 `model.publish_paths` 内，当前 supply_chain/package_forecast 示例为：
 
 ```text
-baseline/src/**
-baseline/requirements.txt
+src/supply_chain/forecast/package_forecast/**
 ```
 
-这些路径相对于 `mcp.git.repo_path`，默认 worktree 是：
+这些路径相对于 `mcp.git.repo.path`，当前示例 worktree 是：
 
 ```text
-../ForecastModel_worktree/
+../SupplyChain_worktree/
 ```
 
 因此模型代码链路是：
 
 ```text
-远端 ForecastModel 分支
-  -> Git MCP sync 到 ../ForecastModel_worktree/baseline/
-  -> T2 Copy 到 runs/<run>/trial_xxx/candidate/code/
-  -> T3 执行候选代码
-  -> KEEP 时 apply/commit/push 回 ../ForecastModel_worktree/baseline/
+远端 origin/develop
+  -> Git MCP sync 到 ../SupplyChain_worktree/（ff-only，不 reset，不 force push）
+  -> Copy: src/supply_chain/forecast/package_forecast 按 copy_include/copy_exclude 复制到 candidate/code/
+  -> T2b: Codex 基于 model_contract 生成 train.py 和 agent2_execution_plan.yaml
+  -> T3: 执行 train_command，并按 output_contract 计算新旧指标
+  -> KEEP: apply candidate/code 回 publish_paths，commit 到当前 trial 分支
+  -> 人工 KEEP: 才允许 push direct_branch 或 branch_pr；未人工 KEEP 时只保留本地 commit/草稿
 ```
 
 当前项目内的 `baseline/data/` 和 `baseline/outputs/` 仍是实验数据与 baseline 指标来源，不是 Git MCP 模型源码同步目标。
 
-非 KEEP 决策不会推送远程仓库。当前配置默认面向 `forecastops/ForecastModel` 远端分支，`create_pr_on_keep` 默认关闭，避免误用 GitHub PR 逻辑操作 GitLab 仓库。
+非 KEEP 决策不会推送远程仓库。`publish.mode=direct_branch` 会保持当前直接推目标分支能力；`publish.mode=branch_pr` 会推实验分支并生成 PR/MR 草稿路径。GitHub PR 由 `gh pr create` 处理；GitLab 仓库建议先使用草稿或后续接入 GitLab MR API。
 
 Git 动作日志写入：
 

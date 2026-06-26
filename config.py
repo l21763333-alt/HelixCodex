@@ -244,9 +244,99 @@ class LarkMcpConfig:
 
 
 @dataclass
+class GitRepoSourceConfig:
+    path: str = ""
+    url: str = ""
+    lifecycle: str = "existing_worktree"
+    remote: str = ""
+    base_branch: str = ""
+    sync_strategy: str = "ff_only"
+
+
+@dataclass
+class GitModelOutputContractConfig:
+    prediction_path: str = "{trial_id}_package_detail.csv"
+    actual_path: str = ""
+    split_column: str = "split"
+    split_filter: str = "test"
+    actual_column: str = ""
+    prediction_column: str = ""
+    actual_candidates: list[str] = field(default_factory=lambda: [
+        "true_pos_cnt",
+        "true_real_qty_sum",
+        "actual",
+        "y_true",
+    ])
+    prediction_candidates: list[str] = field(default_factory=lambda: [
+        "pred_pos_cnt",
+        "pred_real_qty_sum",
+        "prediction",
+        "y_pred",
+    ])
+    error_column: str = ""
+    abs_error_column: str = ""
+    baseline_prediction_globs: list[str] = field(default_factory=lambda: [
+        "*_package_detail.csv",
+        "*.csv",
+    ])
+    secondary_metric_globs: list[str] = field(default_factory=lambda: [
+        "*_store_dish_day.csv",
+    ])
+    primary_level: str = "package_detail"
+    secondary_level: str = "store_dish_day"
+
+
+@dataclass
+class GitModelConfig:
+    root: str = "baseline"
+    copy_include: list[str] = field(default_factory=lambda: [
+        "src/**",
+        "requirements.txt",
+        "train.py",
+    ])
+    copy_exclude: list[str] = field(default_factory=lambda: [
+        "__pycache__/**",
+        "*.pyc",
+        ".git/**",
+        "data/**",
+        "outputs/**",
+        "logs/**",
+    ])
+    publish_paths: list[str] = field(default_factory=list)
+    requirements_paths: list[str] = field(default_factory=lambda: [
+        "requirements.txt",
+    ])
+    entrypoint_candidates: list[str] = field(default_factory=lambda: [
+        "train.py",
+        "src/train.py",
+        "main.py",
+    ])
+    default_train_command: list[str] = field(default_factory=list)
+    output_contract: GitModelOutputContractConfig | dict = field(
+        default_factory=GitModelOutputContractConfig
+    )
+
+
+@dataclass
+class GitPublishConfig:
+    mode: str = "direct_branch"
+    push_on_keep: bool | None = None
+    target_branch: str = ""
+    branch_prefix: str = ""
+    create_pr: bool | None = None
+    pr_draft: bool | None = None
+
+
+@dataclass
 class GitRepositoryConfig:
     repo_id: str = "default"
+    repo: GitRepoSourceConfig | dict = field(default_factory=GitRepoSourceConfig)
+    model: GitModelConfig | dict = field(default_factory=GitModelConfig)
+    publish: GitPublishConfig | dict = field(default_factory=GitPublishConfig)
     repo_path: str = ""
+    repo_url: str = ""
+    repo_lifecycle: str = ""
+    sync_strategy: str = ""
     baseline_dir: str = ""
     source_dir: str = ""
     requirements: str = ""
@@ -266,7 +356,13 @@ class GitMcpConfig:
     enabled: bool = True
     scope: str = "baseline_model"
     active_repo: str = "default"
+    repo: GitRepoSourceConfig | dict = field(default_factory=GitRepoSourceConfig)
+    model: GitModelConfig | dict = field(default_factory=GitModelConfig)
+    publish: GitPublishConfig | dict = field(default_factory=GitPublishConfig)
     repo_path: str = "."
+    repo_url: str = ""
+    repo_lifecycle: str = "existing_worktree"
+    sync_strategy: str = "ff_only"
     baseline_dir: str = "baseline"
     source_dir: str = ""
     requirements: str = ""
@@ -311,35 +407,182 @@ class GitMcpConfig:
         else:
             repo = GitRepositoryConfig(repo_id=target_id)
 
-        baseline_dir = repo.baseline_dir or self.baseline_dir
+        top_repo = _coerce_dataclass(GitRepoSourceConfig, self.repo)
+        repo_source = _coerce_dataclass(GitRepoSourceConfig, repo.repo)
+        top_model = _coerce_git_model_config(self.model)
+        repo_model = _coerce_git_model_config(repo.model)
+        top_publish = _coerce_dataclass(GitPublishConfig, self.publish)
+        repo_publish = _coerce_dataclass(GitPublishConfig, repo.publish)
+
+        if _has_explicit_model_root(repo.model):
+            baseline_dir = repo_model.root
+        elif repo.baseline_dir:
+            baseline_dir = repo.baseline_dir
+        elif _has_explicit_model_root(self.model):
+            baseline_dir = top_model.root
+        else:
+            baseline_dir = self.baseline_dir
+
         source_dir = repo.source_dir or self.source_dir or str(Path(baseline_dir) / "src")
-        requirements = repo.requirements or self.requirements or str(Path(baseline_dir) / "requirements.txt")
+        requirements = (
+            repo.requirements
+            or self.requirements
+            or str(Path(baseline_dir) / "requirements.txt")
+        )
         repo_has_layout = bool(repo.baseline_dir or repo.source_dir or repo.requirements)
-        if repo.allowed_paths:
+
+        if _has_explicit_model_field(repo.model, "requirements_paths"):
+            requirements_paths = list(repo_model.requirements_paths)
+        elif _has_explicit_model_field(self.model, "requirements_paths"):
+            requirements_paths = list(top_model.requirements_paths)
+        elif requirements:
+            requirements_paths = [_relative_to_model_root(requirements, baseline_dir)]
+        else:
+            requirements_paths = []
+
+        if _has_explicit_model_field(repo.model, "copy_include"):
+            copy_include = list(repo_model.copy_include)
+        elif _has_explicit_model_field(self.model, "copy_include"):
+            copy_include = list(top_model.copy_include)
+        else:
+            copy_include = _default_copy_include(source_dir, requirements, baseline_dir)
+
+        if _has_explicit_model_field(repo.model, "copy_exclude"):
+            copy_exclude = list(repo_model.copy_exclude)
+        else:
+            copy_exclude = list(top_model.copy_exclude)
+
+        if repo_model.publish_paths:
+            allowed_paths = list(repo_model.publish_paths)
+        elif repo.allowed_paths:
             allowed_paths = list(repo.allowed_paths)
+        elif top_model.publish_paths:
+            allowed_paths = list(top_model.publish_paths)
         elif self.repositories and repo_has_layout:
-            allowed_paths = [f"{source_dir.rstrip('/')}/**", requirements]
+            allowed_paths = [f"{source_dir.rstrip('/')}/**"]
+            if requirements:
+                allowed_paths.append(requirements)
         else:
             allowed_paths = list(self.allowed_paths)
+
+        output_contract = _merge_dataclass_dict(
+            GitModelOutputContractConfig,
+            top_model.output_contract,
+            repo_model.output_contract,
+            prefer_second=_has_explicit_model_field(repo.model, "output_contract"),
+        )
+        model_cfg = GitModelConfig(
+            root=baseline_dir,
+            copy_include=copy_include,
+            copy_exclude=copy_exclude,
+            publish_paths=allowed_paths,
+            requirements_paths=requirements_paths,
+            entrypoint_candidates=(
+                list(repo_model.entrypoint_candidates)
+                if _has_explicit_model_field(repo.model, "entrypoint_candidates")
+                else list(top_model.entrypoint_candidates)
+            ),
+            default_train_command=(
+                list(repo_model.default_train_command)
+                if _has_explicit_model_field(repo.model, "default_train_command")
+                else list(top_model.default_train_command)
+            ),
+            output_contract=output_contract,
+        )
+
+        repo_path = repo_source.path or repo.repo_path or top_repo.path or self.repo_path
+        repo_url = repo_source.url or repo.repo_url or top_repo.url or self.repo_url
+        lifecycle = (
+            repo_source.lifecycle
+            if _has_explicit_dataclass_field(repo.repo, GitRepoSourceConfig, "lifecycle")
+            else repo.repo_lifecycle
+            or (top_repo.lifecycle if _has_explicit_dataclass_field(self.repo, GitRepoSourceConfig, "lifecycle") else "")
+            or self.repo_lifecycle
+            or "existing_worktree"
+        )
+        remote = repo_source.remote or repo.remote or top_repo.remote or self.remote
+        base_branch = repo_source.base_branch or repo.base_branch or top_repo.base_branch or self.base_branch
+        sync_strategy = (
+            repo_source.sync_strategy
+            if _has_explicit_dataclass_field(repo.repo, GitRepoSourceConfig, "sync_strategy")
+            else repo.sync_strategy
+            or (top_repo.sync_strategy if _has_explicit_dataclass_field(self.repo, GitRepoSourceConfig, "sync_strategy") else "")
+            or self.sync_strategy
+            or "ff_only"
+        )
+        repo_source_cfg = GitRepoSourceConfig(
+            path=repo_path,
+            url=repo_url,
+            lifecycle=lifecycle,
+            remote=remote,
+            base_branch=base_branch,
+            sync_strategy=sync_strategy,
+        )
+
+        publish_cfg = GitPublishConfig(
+            mode=(
+                repo_publish.mode
+                if _has_explicit_dataclass_field(repo.publish, GitPublishConfig, "mode")
+                else top_publish.mode
+                if _has_explicit_dataclass_field(self.publish, GitPublishConfig, "mode")
+                else "direct_branch"
+            ),
+            push_on_keep=(
+                repo_publish.push_on_keep
+                if repo_publish.push_on_keep is not None
+                else repo.push_on_keep
+                if repo.push_on_keep is not None
+                else top_publish.push_on_keep
+                if top_publish.push_on_keep is not None
+                else self.push_on_keep
+            ),
+            target_branch=(
+                repo_publish.target_branch
+                or repo.push_target_branch
+                or top_publish.target_branch
+                or self.push_target_branch
+            ),
+            branch_prefix=repo_publish.branch_prefix or repo.branch_prefix or top_publish.branch_prefix or self.branch_prefix,
+            create_pr=(
+                repo_publish.create_pr
+                if repo_publish.create_pr is not None
+                else repo.create_pr_on_keep
+                if repo.create_pr_on_keep is not None
+                else top_publish.create_pr
+                if top_publish.create_pr is not None
+                else self.create_pr_on_keep
+            ),
+            pr_draft=(
+                repo_publish.pr_draft
+                if repo_publish.pr_draft is not None
+                else repo.pr_draft
+                if repo.pr_draft is not None
+                else top_publish.pr_draft
+                if top_publish.pr_draft is not None
+                else self.pr_draft
+            ),
+        )
         return GitRepositoryConfig(
             repo_id=target_id,
-            repo_path=repo.repo_path or self.repo_path,
+            repo=repo_source_cfg,
+            model=model_cfg,
+            publish=publish_cfg,
+            repo_path=repo_path,
+            repo_url=repo_url,
+            repo_lifecycle=lifecycle,
+            sync_strategy=sync_strategy,
             baseline_dir=baseline_dir,
             source_dir=source_dir,
             requirements=requirements,
             allowed_paths=allowed_paths,
             trial_code_subdir=repo.trial_code_subdir or self.trial_code_subdir,
-            branch_prefix=repo.branch_prefix or self.branch_prefix,
-            remote=repo.remote or self.remote,
-            base_branch=repo.base_branch or self.base_branch,
-            push_target_branch=repo.push_target_branch or self.push_target_branch,
-            push_on_keep=repo.push_on_keep if repo.push_on_keep is not None else self.push_on_keep,
-            create_pr_on_keep=(
-                repo.create_pr_on_keep
-                if repo.create_pr_on_keep is not None
-                else self.create_pr_on_keep
-            ),
-            pr_draft=repo.pr_draft if repo.pr_draft is not None else self.pr_draft,
+            branch_prefix=publish_cfg.branch_prefix,
+            remote=remote,
+            base_branch=base_branch,
+            push_target_branch=publish_cfg.target_branch,
+            push_on_keep=bool(publish_cfg.push_on_keep),
+            create_pr_on_keep=bool(publish_cfg.create_pr),
+            pr_draft=bool(publish_cfg.pr_draft),
         )
 
 
@@ -445,19 +688,93 @@ def _apply_dataclass_section(target, data: dict) -> None:
             setattr(target, key, value)
 
 
+def _coerce_dataclass(cls, data):
+    if isinstance(data, cls):
+        return data
+    if not isinstance(data, dict):
+        return cls()
+    allowed = {field.name for field in dataclass_fields(cls)}
+    values = {key: value for key, value in data.items() if key in allowed and value is not None}
+    return cls(**values)
+
+
+def _coerce_git_model_config(data) -> GitModelConfig:
+    cfg = _coerce_dataclass(GitModelConfig, data)
+    cfg.output_contract = _coerce_dataclass(
+        GitModelOutputContractConfig,
+        cfg.output_contract,
+    )
+    return cfg
+
+
+def _dataclass_dict(cls, data) -> dict:
+    return asdict(_coerce_dataclass(cls, data))
+
+
+def _merge_dataclass_dict(cls, first, second, *, prefer_second: bool) -> dict:
+    merged = _dataclass_dict(cls, first)
+    if prefer_second:
+        for key, value in _dataclass_dict(cls, second).items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+    return merged
+
+
+def _has_explicit_model_field(data, field_name: str) -> bool:
+    if isinstance(data, GitModelConfig):
+        default = GitModelConfig()
+        current = getattr(data, field_name, None)
+        default_value = getattr(default, field_name, None)
+        if field_name == "output_contract":
+            return asdict(_coerce_dataclass(GitModelOutputContractConfig, current)) != asdict(default.output_contract)
+        return current != default_value
+    return isinstance(data, dict) and field_name in data and data[field_name] is not None
+
+
+def _has_explicit_model_root(data) -> bool:
+    return _has_explicit_model_field(data, "root")
+
+
+def _has_explicit_dataclass_field(data, cls, field_name: str) -> bool:
+    if isinstance(data, cls):
+        return getattr(data, field_name, None) != getattr(cls(), field_name, None)
+    return isinstance(data, dict) and field_name in data and data[field_name] is not None
+
+
+def _relative_to_model_root(path: str, root: str) -> str:
+    candidate = Path(path)
+    model_root = Path(root)
+    try:
+        rel = candidate.relative_to(model_root)
+        return rel.as_posix() or "."
+    except ValueError:
+        return candidate.as_posix()
+
+
+def _default_copy_include(source_dir: str, requirements: str, root: str) -> list[str]:
+    include = [f"{_relative_to_model_root(source_dir, root).rstrip('/')}/**"]
+    if requirements:
+        include.append(_relative_to_model_root(requirements, root))
+    include.append("train.py")
+    return include
+
+
 def _coerce_git_repo_config(repo_id: str, data) -> GitRepositoryConfig:
     if isinstance(data, GitRepositoryConfig):
-        if data.repo_id == repo_id:
-            return data
         values = asdict(data)
         values["repo_id"] = repo_id
-        return GitRepositoryConfig(**values)
-    if not isinstance(data, dict):
-        raise TypeError(f"Git MCP repository {repo_id!r} must be a mapping")
-    allowed = {field.name for field in dataclass_fields(GitRepositoryConfig)}
-    values = {key: value for key, value in data.items() if key in allowed and value is not None}
-    values["repo_id"] = repo_id
-    return GitRepositoryConfig(**values)
+        cfg = GitRepositoryConfig(**values)
+    else:
+        if not isinstance(data, dict):
+            raise TypeError(f"Git MCP repository {repo_id!r} must be a mapping")
+        allowed = {field.name for field in dataclass_fields(GitRepositoryConfig)}
+        values = {key: value for key, value in data.items() if key in allowed and value is not None}
+        values["repo_id"] = repo_id
+        cfg = GitRepositoryConfig(**values)
+    cfg.repo = _coerce_dataclass(GitRepoSourceConfig, cfg.repo)
+    cfg.model = _coerce_git_model_config(cfg.model)
+    cfg.publish = _coerce_dataclass(GitPublishConfig, cfg.publish)
+    return cfg
 
 
 def _coerce_git_repositories(data) -> dict[str, GitRepositoryConfig]:
@@ -547,16 +864,21 @@ def load_config(path: Path | str | None = None) -> Config:
         _apply_section(config.mcp, raw.get("mcp", {}), "lark",
                        ["enabled", "backend", "server_name"])
         _apply_section(config.mcp, raw.get("mcp", {}), "git",
-                       ["enabled", "scope", "active_repo", "repo_path", "baseline_dir",
-                        "source_dir", "requirements", "allowed_paths",
+                       ["enabled", "scope", "active_repo",
+                        "repo", "model", "publish",
+                        "repo_path", "repo_url", "repo_lifecycle",
+                        "baseline_dir", "source_dir", "requirements", "allowed_paths",
                         "trial_code_subdir", "branch_prefix",
-                        "remote", "base_branch",
+                        "remote", "base_branch", "sync_strategy",
                         "sync_on_loop_start", "sync_before_each_trial",
                         "publish_via_subagent", "push_on_keep",
                         "create_pr_on_keep", "pr_draft", "push_target_branch",
                         "server_transport", "server_command", "server_args",
                         "require_human_approval_for_push",
                         "allow_force_push", "allow_reset_hard", "repositories"])
+        config.mcp.git.repo = _coerce_dataclass(GitRepoSourceConfig, config.mcp.git.repo)
+        config.mcp.git.model = _coerce_git_model_config(config.mcp.git.model)
+        config.mcp.git.publish = _coerce_dataclass(GitPublishConfig, config.mcp.git.publish)
         config.mcp.git.repositories = _coerce_git_repositories(config.mcp.git.repositories)
 
     # 环境变量覆盖

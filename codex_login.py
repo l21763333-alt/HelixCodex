@@ -79,7 +79,7 @@ def main() -> int:
                 pass
             print(f"  [Auth] 等待 session 生效... ({retry + 1}/15)")
         else:
-            print("[Auth] ❌ session 不可用, 请在 codex_flow_config.json 中设置 openai_api_key")
+            print("[Auth] ❌ session 不可用, 请设置 OPENAI_API_KEY 或 flow_config.yaml 的 auth.openai_api_key")
             return 1
 
         # 等 app-server 把 session 写入磁盘

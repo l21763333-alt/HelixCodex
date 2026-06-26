@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 import tempfile
@@ -143,27 +144,80 @@ class GitMcpAdapterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             baseline_src = root / "baseline" / "src"
-            trial_src = root / "runs" / "trial_001" / "agent2" / "code" / "src"
+            trial_src = root / "runs" / "trial_001" / "candidate" / "code" / "src"
             baseline_src.mkdir(parents=True)
             trial_src.mkdir(parents=True)
             (baseline_src / "model.py").write_text("x = 1\n", encoding="utf-8")
             (trial_src / "model.py").write_text("x = 2\n", encoding="utf-8")
             (trial_src / "extra.py").write_text("y = 1\n", encoding="utf-8")
 
-            old_baseline_src = git_mcp._baseline_src
-            old_baseline_req = git_mcp._baseline_requirements
-            try:
-                git_mcp._baseline_src = lambda: baseline_src  # type: ignore[assignment]
-                git_mcp._baseline_requirements = lambda: root / "baseline" / "requirements.txt"  # type: ignore[assignment]
-                diff = git_mcp.diff_trial_model_code(root / "runs" / "trial_001" / "agent2" / "code")
-            finally:
-                git_mcp._baseline_src = old_baseline_src  # type: ignore[assignment]
-                git_mcp._baseline_requirements = old_baseline_req  # type: ignore[assignment]
+            git_cfg = GitMcpConfig(
+                repo_path=str(root),
+                baseline_dir="baseline",
+                source_dir="baseline/src",
+                requirements="baseline/requirements.txt",
+                allowed_paths=["baseline/src/**", "baseline/requirements.txt"],
+            )
+            fake_config = types.SimpleNamespace(mcp=types.SimpleNamespace(git=git_cfg))
+
+            with patch.object(git_mcp, "get_config", return_value=fake_config):
+                diff = git_mcp.diff_trial_model_code(root / "runs" / "trial_001" / "candidate" / "code")
 
             self.assertEqual(diff["changed"], 1)
             self.assertEqual(diff["added"], 1)
             self.assertIn("M src/model.py", diff["summary"])
             self.assertIn("A src/extra.py", diff["summary"])
+
+    def test_new_schema_maps_to_legacy_fields(self) -> None:
+        git_cfg = GitMcpConfig(
+            active_repo="supply",
+            repositories={
+                "supply": GitRepositoryConfig(
+                    repo={
+                        "path": "/tmp/worktree",
+                        "url": "https://example.invalid/repo.git",
+                        "lifecycle": "clone_if_missing",
+                        "remote": "upstream",
+                        "base_branch": "develop",
+                    },
+                    model={
+                        "root": "pkg/model",
+                        "copy_include": ["**"],
+                        "copy_exclude": ["outputs/**"],
+                        "publish_paths": ["pkg/model/**"],
+                        "requirements_paths": [],
+                        "entrypoint_candidates": ["train.py"],
+                        "default_train_command": ["python", "{trial_code_dir}/train.py"],
+                        "output_contract": {
+                            "prediction_path": "pred.csv",
+                            "actual_column": "actual",
+                            "prediction_column": "prediction",
+                        },
+                    },
+                    publish={
+                        "mode": "branch_pr",
+                        "branch_prefix": "exp/",
+                        "target_branch": "develop",
+                        "push_on_keep": True,
+                        "create_pr": True,
+                        "pr_draft": True,
+                    },
+                )
+            },
+        )
+
+        repo = git_cfg.resolve_repo("supply")
+
+        self.assertEqual(repo.repo_path, "/tmp/worktree")
+        self.assertEqual(repo.repo_url, "https://example.invalid/repo.git")
+        self.assertEqual(repo.repo_lifecycle, "clone_if_missing")
+        self.assertEqual(repo.baseline_dir, "pkg/model")
+        self.assertEqual(repo.allowed_paths, ["pkg/model/**"])
+        self.assertEqual(repo.branch_prefix, "exp/")
+        self.assertEqual(repo.push_target_branch, "develop")
+        self.assertTrue(repo.create_pr_on_keep)
+        self.assertEqual(repo.model.requirements_paths, [])
+        self.assertEqual(repo.model.output_contract["prediction_path"], "pred.csv")
 
     def test_repo_id_selects_configured_model_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,7 +226,7 @@ class GitMcpAdapterTest(unittest.TestCase):
             repo_b = root / "repo_b"
             (repo_a / "model" / "src").mkdir(parents=True)
             (repo_b / "custom" / "source").mkdir(parents=True)
-            trial_src = root / "runs" / "trial_001" / "candidate" / "code" / "src"
+            trial_src = root / "runs" / "trial_001" / "candidate" / "code" / "source"
             trial_src.mkdir(parents=True)
             (repo_b / "custom" / "source" / "model.py").write_text("x = 1\n", encoding="utf-8")
             (trial_src / "model.py").write_text("x = 2\n", encoding="utf-8")
@@ -209,7 +263,55 @@ class GitMcpAdapterTest(unittest.TestCase):
             self.assertEqual(ctx.source_dir, (repo_b / "custom" / "source").resolve())
             self.assertEqual(ctx.allowed_pathspecs, ["custom/source", "custom/req.txt"])
             self.assertEqual(diff["changed"], 1)
+            self.assertIn("M source/model.py", diff["summary"])
             self.assertEqual(diff["repo_id"], "repo_b")
+
+    def test_clone_if_missing_uses_local_bare_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin = root / "origin.git"
+            seed = root / "seed"
+            clone_path = root / "clone"
+            subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+            subprocess.run(["git", "clone", str(origin), str(seed)], check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=seed, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=seed, check=True)
+            (seed / "model").mkdir()
+            (seed / "model" / "train.py").write_text("print('ok')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "model/train.py"], cwd=seed, check=True)
+            subprocess.run(["git", "commit", "-m", "seed"], cwd=seed, check=True, capture_output=True)
+            subprocess.run(["git", "branch", "-M", "develop"], cwd=seed, check=True)
+            subprocess.run(["git", "push", "origin", "develop"], cwd=seed, check=True, capture_output=True)
+
+            git_cfg = GitMcpConfig(
+                active_repo="clone",
+                repositories={
+                    "clone": GitRepositoryConfig(
+                        repo={
+                            "path": str(clone_path),
+                            "url": str(origin),
+                            "lifecycle": "clone_if_missing",
+                            "remote": "origin",
+                            "base_branch": "develop",
+                        },
+                        model={
+                            "root": "model",
+                            "copy_include": ["**"],
+                            "publish_paths": ["model/**"],
+                            "requirements_paths": [],
+                        },
+                        publish={"branch_prefix": "exp/", "target_branch": "develop"},
+                    )
+                },
+            )
+            fake_config = types.SimpleNamespace(mcp=types.SimpleNamespace(git=git_cfg))
+
+            with patch.object(git_mcp, "get_config", return_value=fake_config):
+                sync = git_mcp.sync_remote_base(repo_id="clone")
+
+            self.assertTrue(sync["synced"])
+            self.assertTrue((clone_path / ".git").exists())
+            self.assertTrue((clone_path / "model" / "train.py").exists())
 
 
 if __name__ == "__main__":
