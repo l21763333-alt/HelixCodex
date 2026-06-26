@@ -672,7 +672,7 @@ def _codex_gateway_proxy_url(cfg: Config) -> str:
 def build_codex_config() -> CodexConfig:
     cfg = get_config()
     env: dict[str, str] = {
-        "RUST_LOG": "info",
+        "RUST_LOG": os.environ.get("RUST_LOG", "info"),
         "CODEX_HOME": cfg.resolved_codex_home,
     }
     if cfg.codex_gateway.enabled:
@@ -688,6 +688,22 @@ def build_codex_config() -> CodexConfig:
                 "NO_PROXY": "127.0.0.1,localhost",
                 "no_proxy": "127.0.0.1,localhost",
             })
+    for key in (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "CODEX_CA_CERTIFICATE",
+        "SSL_CERT_FILE",
+        "CODEX_ACCESS_TOKEN",
+    ):
+        value = os.environ.get(key)
+        if value and key not in env:
+            env[key] = value
     return CodexConfig(env=env, config_overrides=cfg.codex_config_overrides())
 
 

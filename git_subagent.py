@@ -51,7 +51,8 @@ def ensure_git_mcp_registered() -> dict[str, Any]:
         r"(?=\n\[(?!mcp_servers\.git_research(?:\.|\]))[^\]]+\]|\Z)"
     )
     if pattern.search(text):
-        new_text = pattern.sub("\n" + block.rstrip(), text).rstrip() + "\n"
+        replacement = "\n" + block.rstrip()
+        new_text = pattern.sub(lambda _match: replacement, text).rstrip() + "\n"
     else:
         new_text = text.rstrip() + "\n\n" + block if text.strip() else block
     if new_text != text:

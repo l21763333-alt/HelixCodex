@@ -2408,12 +2408,21 @@ def run_workflow(
 
             failure_type = comparison.get("failure_type") if comparison else None
             eval_error = comparison.get("eval_error") if comparison else None
+            retry_output_contract = _default_output_contract()
+            try:
+                import yaml
+
+                exec_plan_path = output_dir / "agent2" / "agent2_execution_plan.yaml"
+                exec_plan = yaml.safe_load(exec_plan_path.read_text(encoding="utf-8")) if exec_plan_path.exists() else {}
+                retry_output_contract = _output_contract(exec_plan if isinstance(exec_plan, dict) else {})
+            except Exception:
+                retry_output_contract = _default_output_contract()
             error_text = (
                 f"failure_type={failure_type}\n"
                 f"eval_error={eval_error}\n\n"
                 f"{error_text}\n\n"
                 "Repair guidance:\n"
-                f"- output_contract={json.dumps(output_contract, ensure_ascii=False)}\n"
+                f"- output_contract={json.dumps(retry_output_contract, ensure_ascii=False)}\n"
                 "- Make train_command finish within the configured timeout on the full data reference.\n"
                 "- Write the configured prediction_path with the configured split and metric columns.\n"
                 "- Do not write the raw feature table as the evaluation output.\n"
