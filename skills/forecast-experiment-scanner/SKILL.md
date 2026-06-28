@@ -36,6 +36,7 @@ description: 当需要从预测实验目录发现代码、配置、日志、pred
 
 - 文件选择必须由 deterministic tool 完成；LLM 只基于扫描摘要和文件头部线索做解释与下一步判断。
 - 不写死业务类型，不得把通用扫描逻辑绑定到某个具体业务场景、产物命名或业务线。
+- 训练入口、源码根目录和 requirements 位置可能由 model contract 配置，不得假设固定为 `src/` 或单个 `requirements.txt`。
 - 可以保留历史兼容字段，但报告主线必须使用通用字段，例如 `domain_artifact_files`、`candidate_prediction_files`、`actual_files`、`log_files`。
 - 多候选无法可靠判断时，标记 ambiguous。
 - 找不到 prediction 或 actual 不报错，后续进入 Diagnostic 模式。

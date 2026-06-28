@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 
 from openai_codex.client import CodexConfig
 
@@ -35,6 +35,7 @@ class FeishuConfig:
     chat_id: str = ""
     poll_interval: int = 5
     verification_token: str = ""
+    encrypt_key: str = ""
 
 
 @dataclass
@@ -101,8 +102,8 @@ class FlowPathRoots:
 @dataclass
 class FlowPathData:
     mode: str = "reference_only"
-    root: str = "baseline/data"
-    primary: str = "baseline/data/dish_package_feature_df.csv"
+    root: str = "/data/dataworks_data"
+    primary: str = "/data/dataworks_data/dwd_forecast_package_feature_df.csv"
     auxiliary: list[str] = field(default_factory=lambda: [
         "baseline/data/holiday_imformation.csv",
     ])
@@ -243,11 +244,128 @@ class LarkMcpConfig:
 
 
 @dataclass
+class GitRepoSourceConfig:
+    path: str = ""
+    url: str = ""
+    lifecycle: str = "existing_worktree"
+    remote: str = ""
+    base_branch: str = ""
+    sync_strategy: str = "ff_only"
+
+
+@dataclass
+class GitModelOutputContractConfig:
+    prediction_path: str = "{trial_id}_package_detail.csv"
+    actual_path: str = ""
+    split_column: str = "split"
+    split_filter: str = "test"
+    actual_column: str = ""
+    prediction_column: str = ""
+    actual_candidates: list[str] = field(default_factory=lambda: [
+        "true_pos_cnt",
+        "true_real_qty_sum",
+        "actual",
+        "y_true",
+    ])
+    prediction_candidates: list[str] = field(default_factory=lambda: [
+        "pred_pos_cnt",
+        "pred_real_qty_sum",
+        "prediction",
+        "y_pred",
+    ])
+    error_column: str = ""
+    abs_error_column: str = ""
+    baseline_prediction_globs: list[str] = field(default_factory=lambda: [
+        "*_package_detail.csv",
+        "*.csv",
+    ])
+    secondary_metric_globs: list[str] = field(default_factory=lambda: [
+        "*_store_dish_day.csv",
+    ])
+    primary_level: str = "package_detail"
+    secondary_level: str = "store_dish_day"
+
+
+@dataclass
+class GitModelConfig:
+    root: str = "baseline"
+    copy_include: list[str] = field(default_factory=lambda: [
+        "src/**",
+        "requirements.txt",
+        "train.py",
+    ])
+    copy_exclude: list[str] = field(default_factory=lambda: [
+        "__pycache__/**",
+        "*.pyc",
+        ".git/**",
+        "data/**",
+        "outputs/**",
+        "logs/**",
+    ])
+    publish_paths: list[str] = field(default_factory=list)
+    requirements_paths: list[str] = field(default_factory=lambda: [
+        "requirements.txt",
+    ])
+    entrypoint_candidates: list[str] = field(default_factory=lambda: [
+        "train.py",
+        "src/train.py",
+        "main.py",
+    ])
+    default_train_command: list[str] = field(default_factory=list)
+    output_contract: GitModelOutputContractConfig | dict = field(
+        default_factory=GitModelOutputContractConfig
+    )
+
+
+@dataclass
+class GitPublishConfig:
+    mode: str = "direct_branch"
+    push_on_keep: bool | None = None
+    target_branch: str = ""
+    branch_prefix: str = ""
+    create_pr: bool | None = None
+    pr_draft: bool | None = None
+
+
+@dataclass
+class GitRepositoryConfig:
+    repo_id: str = "default"
+    repo: GitRepoSourceConfig | dict = field(default_factory=GitRepoSourceConfig)
+    model: GitModelConfig | dict = field(default_factory=GitModelConfig)
+    publish: GitPublishConfig | dict = field(default_factory=GitPublishConfig)
+    repo_path: str = ""
+    repo_url: str = ""
+    repo_lifecycle: str = ""
+    sync_strategy: str = ""
+    baseline_dir: str = ""
+    source_dir: str = ""
+    requirements: str = ""
+    allowed_paths: list[str] = field(default_factory=list)
+    trial_code_subdir: str = ""
+    branch_prefix: str = ""
+    remote: str = ""
+    base_branch: str = ""
+    push_target_branch: str = ""
+    push_on_keep: bool | None = None
+    create_pr_on_keep: bool | None = None
+    pr_draft: bool | None = None
+
+
+@dataclass
 class GitMcpConfig:
     enabled: bool = True
     scope: str = "baseline_model"
+    active_repo: str = "default"
+    repo: GitRepoSourceConfig | dict = field(default_factory=GitRepoSourceConfig)
+    model: GitModelConfig | dict = field(default_factory=GitModelConfig)
+    publish: GitPublishConfig | dict = field(default_factory=GitPublishConfig)
     repo_path: str = "."
+    repo_url: str = ""
+    repo_lifecycle: str = "existing_worktree"
+    sync_strategy: str = "ff_only"
     baseline_dir: str = "baseline"
+    source_dir: str = ""
+    requirements: str = ""
     allowed_paths: list[str] = field(default_factory=lambda: [
         "baseline/src/**",
         "baseline/requirements.txt",
@@ -271,12 +389,222 @@ class GitMcpConfig:
     require_human_approval_for_push: bool = True
     allow_force_push: bool = False
     allow_reset_hard: bool = False
+    repositories: dict[str, GitRepositoryConfig] = field(default_factory=dict)
+
+    def resolve_repo(self, repo_id: str | None = None) -> GitRepositoryConfig:
+        target_id = repo_id or self.active_repo or "default"
+        repo: GitRepositoryConfig | None = None
+
+        if self.repositories:
+            if target_id in self.repositories:
+                repo = _coerce_git_repo_config(target_id, self.repositories[target_id])
+            elif repo_id is None and len(self.repositories) == 1:
+                target_id, raw_repo = next(iter(self.repositories.items()))
+                repo = _coerce_git_repo_config(target_id, raw_repo)
+            else:
+                known = ", ".join(sorted(self.repositories))
+                raise ValueError(f"unknown Git MCP repo_id {target_id!r}; known repositories: {known}")
+        else:
+            repo = GitRepositoryConfig(repo_id=target_id)
+
+        top_repo = _coerce_dataclass(GitRepoSourceConfig, self.repo)
+        repo_source = _coerce_dataclass(GitRepoSourceConfig, repo.repo)
+        top_model = _coerce_git_model_config(self.model)
+        repo_model = _coerce_git_model_config(repo.model)
+        top_publish = _coerce_dataclass(GitPublishConfig, self.publish)
+        repo_publish = _coerce_dataclass(GitPublishConfig, repo.publish)
+
+        if _has_explicit_model_root(repo.model):
+            baseline_dir = repo_model.root
+        elif repo.baseline_dir:
+            baseline_dir = repo.baseline_dir
+        elif _has_explicit_model_root(self.model):
+            baseline_dir = top_model.root
+        else:
+            baseline_dir = self.baseline_dir
+
+        source_dir = repo.source_dir or self.source_dir or str(Path(baseline_dir) / "src")
+        requirements = (
+            repo.requirements
+            or self.requirements
+            or str(Path(baseline_dir) / "requirements.txt")
+        )
+        repo_has_layout = bool(repo.baseline_dir or repo.source_dir or repo.requirements)
+
+        if _has_explicit_model_field(repo.model, "requirements_paths"):
+            requirements_paths = list(repo_model.requirements_paths)
+        elif _has_explicit_model_field(self.model, "requirements_paths"):
+            requirements_paths = list(top_model.requirements_paths)
+        elif requirements:
+            requirements_paths = [_relative_to_model_root(requirements, baseline_dir)]
+        else:
+            requirements_paths = []
+
+        if _has_explicit_model_field(repo.model, "copy_include"):
+            copy_include = list(repo_model.copy_include)
+        elif _has_explicit_model_field(self.model, "copy_include"):
+            copy_include = list(top_model.copy_include)
+        else:
+            copy_include = _default_copy_include(source_dir, requirements, baseline_dir)
+
+        if _has_explicit_model_field(repo.model, "copy_exclude"):
+            copy_exclude = list(repo_model.copy_exclude)
+        else:
+            copy_exclude = list(top_model.copy_exclude)
+
+        if repo_model.publish_paths:
+            allowed_paths = list(repo_model.publish_paths)
+        elif repo.allowed_paths:
+            allowed_paths = list(repo.allowed_paths)
+        elif top_model.publish_paths:
+            allowed_paths = list(top_model.publish_paths)
+        elif self.repositories and repo_has_layout:
+            allowed_paths = [f"{source_dir.rstrip('/')}/**"]
+            if requirements:
+                allowed_paths.append(requirements)
+        else:
+            allowed_paths = list(self.allowed_paths)
+
+        output_contract = _merge_dataclass_dict(
+            GitModelOutputContractConfig,
+            top_model.output_contract,
+            repo_model.output_contract,
+            prefer_second=_has_explicit_model_field(repo.model, "output_contract"),
+        )
+        model_cfg = GitModelConfig(
+            root=baseline_dir,
+            copy_include=copy_include,
+            copy_exclude=copy_exclude,
+            publish_paths=allowed_paths,
+            requirements_paths=requirements_paths,
+            entrypoint_candidates=(
+                list(repo_model.entrypoint_candidates)
+                if _has_explicit_model_field(repo.model, "entrypoint_candidates")
+                else list(top_model.entrypoint_candidates)
+            ),
+            default_train_command=(
+                list(repo_model.default_train_command)
+                if _has_explicit_model_field(repo.model, "default_train_command")
+                else list(top_model.default_train_command)
+            ),
+            output_contract=output_contract,
+        )
+
+        repo_path = repo_source.path or repo.repo_path or top_repo.path or self.repo_path
+        repo_url = repo_source.url or repo.repo_url or top_repo.url or self.repo_url
+        lifecycle = (
+            repo_source.lifecycle
+            if _has_explicit_dataclass_field(repo.repo, GitRepoSourceConfig, "lifecycle")
+            else repo.repo_lifecycle
+            or (top_repo.lifecycle if _has_explicit_dataclass_field(self.repo, GitRepoSourceConfig, "lifecycle") else "")
+            or self.repo_lifecycle
+            or "existing_worktree"
+        )
+        remote = repo_source.remote or repo.remote or top_repo.remote or self.remote
+        base_branch = repo_source.base_branch or repo.base_branch or top_repo.base_branch or self.base_branch
+        sync_strategy = (
+            repo_source.sync_strategy
+            if _has_explicit_dataclass_field(repo.repo, GitRepoSourceConfig, "sync_strategy")
+            else repo.sync_strategy
+            or (top_repo.sync_strategy if _has_explicit_dataclass_field(self.repo, GitRepoSourceConfig, "sync_strategy") else "")
+            or self.sync_strategy
+            or "ff_only"
+        )
+        repo_source_cfg = GitRepoSourceConfig(
+            path=repo_path,
+            url=repo_url,
+            lifecycle=lifecycle,
+            remote=remote,
+            base_branch=base_branch,
+            sync_strategy=sync_strategy,
+        )
+
+        publish_cfg = GitPublishConfig(
+            mode=(
+                repo_publish.mode
+                if _has_explicit_dataclass_field(repo.publish, GitPublishConfig, "mode")
+                else top_publish.mode
+                if _has_explicit_dataclass_field(self.publish, GitPublishConfig, "mode")
+                else "direct_branch"
+            ),
+            push_on_keep=(
+                repo_publish.push_on_keep
+                if repo_publish.push_on_keep is not None
+                else repo.push_on_keep
+                if repo.push_on_keep is not None
+                else top_publish.push_on_keep
+                if top_publish.push_on_keep is not None
+                else self.push_on_keep
+            ),
+            target_branch=(
+                repo_publish.target_branch
+                or repo.push_target_branch
+                or top_publish.target_branch
+                or self.push_target_branch
+            ),
+            branch_prefix=repo_publish.branch_prefix or repo.branch_prefix or top_publish.branch_prefix or self.branch_prefix,
+            create_pr=(
+                repo_publish.create_pr
+                if repo_publish.create_pr is not None
+                else repo.create_pr_on_keep
+                if repo.create_pr_on_keep is not None
+                else top_publish.create_pr
+                if top_publish.create_pr is not None
+                else self.create_pr_on_keep
+            ),
+            pr_draft=(
+                repo_publish.pr_draft
+                if repo_publish.pr_draft is not None
+                else repo.pr_draft
+                if repo.pr_draft is not None
+                else top_publish.pr_draft
+                if top_publish.pr_draft is not None
+                else self.pr_draft
+            ),
+        )
+        return GitRepositoryConfig(
+            repo_id=target_id,
+            repo=repo_source_cfg,
+            model=model_cfg,
+            publish=publish_cfg,
+            repo_path=repo_path,
+            repo_url=repo_url,
+            repo_lifecycle=lifecycle,
+            sync_strategy=sync_strategy,
+            baseline_dir=baseline_dir,
+            source_dir=source_dir,
+            requirements=requirements,
+            allowed_paths=allowed_paths,
+            trial_code_subdir=repo.trial_code_subdir or self.trial_code_subdir,
+            branch_prefix=publish_cfg.branch_prefix,
+            remote=remote,
+            base_branch=base_branch,
+            push_target_branch=publish_cfg.target_branch,
+            push_on_keep=bool(publish_cfg.push_on_keep),
+            create_pr_on_keep=bool(publish_cfg.create_pr),
+            pr_draft=bool(publish_cfg.pr_draft),
+        )
 
 
 @dataclass
 class McpConfig:
     lark: LarkMcpConfig = field(default_factory=LarkMcpConfig)
     git: GitMcpConfig = field(default_factory=GitMcpConfig)
+
+
+@dataclass
+class CodexGatewayConfig:
+    enabled: bool = False
+    mode: str = "cloudflared_access_tcp"
+    cloudflared_path: str = ".tools/cloudflared"
+    hostname: str = ""
+    listener: str = "127.0.0.1:18080"
+    proxy_url: str = ""
+    log_file: str = ".codex_home/cloudflared-codex.log"
+    pid_file: str = ".codex_home/cloudflared-codex.pid"
+    log_level: str = "info"
+    service_token_id: str = ""
+    service_token_secret: str = ""
 
 
 @dataclass
@@ -290,6 +618,7 @@ class Config:
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    codex_gateway: CodexGatewayConfig = field(default_factory=CodexGatewayConfig)
 
     @property
     def api_key(self) -> str:
@@ -312,12 +641,69 @@ class Config:
         return tuple(overrides)
 
 
+def _existing_proxy_url() -> str:
+    for key in (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+    ):
+        value = os.environ.get(key, "")
+        if value:
+            return value
+    return ""
+
+
+def _listener_proxy_url(cfg: Config) -> str:
+    return f"http://{cfg.codex_gateway.listener}"
+
+
+def _codex_gateway_proxy_url(cfg: Config) -> str:
+    listener_proxy = _listener_proxy_url(cfg)
+    if cfg.codex_gateway.mode == "proxy_env_only":
+        if cfg.codex_gateway.proxy_url and cfg.codex_gateway.proxy_url != listener_proxy:
+            return cfg.codex_gateway.proxy_url
+        return _existing_proxy_url() or cfg.codex_gateway.proxy_url
+    return cfg.codex_gateway.proxy_url or listener_proxy
+
+
 def build_codex_config() -> CodexConfig:
     cfg = get_config()
     env: dict[str, str] = {
-        "RUST_LOG": "info",
+        "RUST_LOG": os.environ.get("RUST_LOG", "info"),
         "CODEX_HOME": cfg.resolved_codex_home,
     }
+    if cfg.codex_gateway.enabled:
+        proxy_url = _codex_gateway_proxy_url(cfg)
+        if proxy_url:
+            env.update({
+                "HTTP_PROXY": proxy_url,
+                "HTTPS_PROXY": proxy_url,
+                "ALL_PROXY": proxy_url,
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "all_proxy": proxy_url,
+                "NO_PROXY": "127.0.0.1,localhost",
+                "no_proxy": "127.0.0.1,localhost",
+            })
+    for key in (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "CODEX_CA_CERTIFICATE",
+        "SSL_CERT_FILE",
+        "CODEX_ACCESS_TOKEN",
+    ):
+        value = os.environ.get(key)
+        if value and key not in env:
+            env[key] = value
     return CodexConfig(env=env, config_overrides=cfg.codex_config_overrides())
 
 
@@ -330,10 +716,18 @@ ENV_OVERRIDES = {
     "FEISHU_APP_SECRET":   ("feishu", "app_secret"),
     "FEISHU_CHAT_ID":      ("feishu", "chat_id"),
     "FEISHU_VERIFICATION_TOKEN": ("feishu", "verification_token"),
+    "FEISHU_ENCRYPT_KEY":  ("feishu", "encrypt_key"),
     "OPENAI_API_KEY":      ("_top", "openai_api_key"),
     "CODEX_API_KEY":       ("_top", "codex_api_key"),
     "CODEX_HOME":          ("_top", "codex_home"),
     "CODEX_MODEL":         ("_top", "model"),
+    "CODEX_GATEWAY_ENABLED": ("codex_gateway", "enabled"),
+    "CODEX_GATEWAY_MODE": ("codex_gateway", "mode"),
+    "CODEX_GATEWAY_HOSTNAME": ("codex_gateway", "hostname"),
+    "CODEX_GATEWAY_LISTENER": ("codex_gateway", "listener"),
+    "CODEX_GATEWAY_PROXY_URL": ("codex_gateway", "proxy_url"),
+    "CODEX_GATEWAY_SERVICE_TOKEN_ID": ("codex_gateway", "service_token_id"),
+    "CODEX_GATEWAY_SERVICE_TOKEN_SECRET": ("codex_gateway", "service_token_secret"),
 }
 
 
@@ -342,7 +736,14 @@ def _set_nested(obj, path: list[str], value) -> None:
     target = obj
     for part in path[:-1]:
         target = getattr(target, part)
-    setattr(target, path[-1], value)
+    current = getattr(target, path[-1], None)
+    setattr(target, path[-1], _coerce_env_value(current, value))
+
+
+def _coerce_env_value(current, value: str):
+    if isinstance(current, bool):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value
 
 
 def _apply_section(config: Config, data: dict, section: str, fields: list[str]) -> None:
@@ -372,6 +773,101 @@ def _apply_dataclass_section(target, data: dict) -> None:
     for key, value in data.items():
         if hasattr(target, key) and value is not None:
             setattr(target, key, value)
+
+
+def _coerce_dataclass(cls, data):
+    if isinstance(data, cls):
+        return data
+    if not isinstance(data, dict):
+        return cls()
+    allowed = {field.name for field in dataclass_fields(cls)}
+    values = {key: value for key, value in data.items() if key in allowed and value is not None}
+    return cls(**values)
+
+
+def _coerce_git_model_config(data) -> GitModelConfig:
+    cfg = _coerce_dataclass(GitModelConfig, data)
+    cfg.output_contract = _coerce_dataclass(
+        GitModelOutputContractConfig,
+        cfg.output_contract,
+    )
+    return cfg
+
+
+def _dataclass_dict(cls, data) -> dict:
+    return asdict(_coerce_dataclass(cls, data))
+
+
+def _merge_dataclass_dict(cls, first, second, *, prefer_second: bool) -> dict:
+    merged = _dataclass_dict(cls, first)
+    if prefer_second:
+        for key, value in _dataclass_dict(cls, second).items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+    return merged
+
+
+def _has_explicit_model_field(data, field_name: str) -> bool:
+    if isinstance(data, GitModelConfig):
+        default = GitModelConfig()
+        current = getattr(data, field_name, None)
+        default_value = getattr(default, field_name, None)
+        if field_name == "output_contract":
+            return asdict(_coerce_dataclass(GitModelOutputContractConfig, current)) != asdict(default.output_contract)
+        return current != default_value
+    return isinstance(data, dict) and field_name in data and data[field_name] is not None
+
+
+def _has_explicit_model_root(data) -> bool:
+    return _has_explicit_model_field(data, "root")
+
+
+def _has_explicit_dataclass_field(data, cls, field_name: str) -> bool:
+    if isinstance(data, cls):
+        return getattr(data, field_name, None) != getattr(cls(), field_name, None)
+    return isinstance(data, dict) and field_name in data and data[field_name] is not None
+
+
+def _relative_to_model_root(path: str, root: str) -> str:
+    candidate = Path(path)
+    model_root = Path(root)
+    try:
+        rel = candidate.relative_to(model_root)
+        return rel.as_posix() or "."
+    except ValueError:
+        return candidate.as_posix()
+
+
+def _default_copy_include(source_dir: str, requirements: str, root: str) -> list[str]:
+    include = [f"{_relative_to_model_root(source_dir, root).rstrip('/')}/**"]
+    if requirements:
+        include.append(_relative_to_model_root(requirements, root))
+    include.append("train.py")
+    return include
+
+
+def _coerce_git_repo_config(repo_id: str, data) -> GitRepositoryConfig:
+    if isinstance(data, GitRepositoryConfig):
+        values = asdict(data)
+        values["repo_id"] = repo_id
+        cfg = GitRepositoryConfig(**values)
+    else:
+        if not isinstance(data, dict):
+            raise TypeError(f"Git MCP repository {repo_id!r} must be a mapping")
+        allowed = {field.name for field in dataclass_fields(GitRepositoryConfig)}
+        values = {key: value for key, value in data.items() if key in allowed and value is not None}
+        values["repo_id"] = repo_id
+        cfg = GitRepositoryConfig(**values)
+    cfg.repo = _coerce_dataclass(GitRepoSourceConfig, cfg.repo)
+    cfg.model = _coerce_git_model_config(cfg.model)
+    cfg.publish = _coerce_dataclass(GitPublishConfig, cfg.publish)
+    return cfg
+
+
+def _coerce_git_repositories(data) -> dict[str, GitRepositoryConfig]:
+    if not isinstance(data, dict):
+        return {}
+    return {str(repo_id): _coerce_git_repo_config(str(repo_id), repo_cfg) for repo_id, repo_cfg in data.items()}
 
 
 def _flow_paths_from_dict(raw: dict) -> FlowPathsConfig:
@@ -452,18 +948,29 @@ def load_config(path: Path | str | None = None) -> Config:
                         "recoverable_codex_phases", "degradable_phases"])
         _apply_section(config, raw, "paths",
                        ["experiment_dir", "runs_dir", "skills_dir"])
+        _apply_section(config, raw, "codex_gateway",
+                       ["enabled", "mode", "cloudflared_path", "hostname",
+                        "listener", "proxy_url", "log_file", "pid_file",
+                        "log_level", "service_token_id", "service_token_secret"])
         _apply_section(config.mcp, raw.get("mcp", {}), "lark",
                        ["enabled", "backend", "server_name"])
         _apply_section(config.mcp, raw.get("mcp", {}), "git",
-                       ["enabled", "scope", "repo_path", "baseline_dir",
-                        "allowed_paths", "trial_code_subdir", "branch_prefix",
-                        "remote", "base_branch",
+                       ["enabled", "scope", "active_repo",
+                        "repo", "model", "publish",
+                        "repo_path", "repo_url", "repo_lifecycle",
+                        "baseline_dir", "source_dir", "requirements", "allowed_paths",
+                        "trial_code_subdir", "branch_prefix",
+                        "remote", "base_branch", "sync_strategy",
                         "sync_on_loop_start", "sync_before_each_trial",
                         "publish_via_subagent", "push_on_keep",
                         "create_pr_on_keep", "pr_draft", "push_target_branch",
                         "server_transport", "server_command", "server_args",
                         "require_human_approval_for_push",
-                        "allow_force_push", "allow_reset_hard"])
+                        "allow_force_push", "allow_reset_hard", "repositories"])
+        config.mcp.git.repo = _coerce_dataclass(GitRepoSourceConfig, config.mcp.git.repo)
+        config.mcp.git.model = _coerce_git_model_config(config.mcp.git.model)
+        config.mcp.git.publish = _coerce_dataclass(GitPublishConfig, config.mcp.git.publish)
+        config.mcp.git.repositories = _coerce_git_repositories(config.mcp.git.repositories)
 
     # 环境变量覆盖
     for env_var, (section, field) in ENV_OVERRIDES.items():
@@ -512,6 +1019,27 @@ def reload_paths(
     global _paths
     _paths = PathRegistry(load_flow_paths(path, local_path))
     return _paths
+
+
+def override_data_primary(
+    data_path: Path | str,
+    *,
+    data_root: Path | str | None = None,
+) -> PathRegistry:
+    """Override the primary training data path for the current process."""
+    value = str(data_path).strip()
+    if not value:
+        raise ValueError("data_path must not be empty")
+
+    paths = get_paths()
+    primary = Path(value).expanduser()
+    paths.cfg.data.primary = str(primary)
+
+    root = Path(data_root).expanduser() if data_root is not None else primary.parent
+    if str(root) not in ("", "."):
+        paths.cfg.data.root = str(root)
+
+    return paths
 
 
 # 便捷函数

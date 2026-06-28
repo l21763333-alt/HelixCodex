@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -11,7 +12,7 @@ class FakePublishGit:
         self.blocked = blocked
         self.calls: list[tuple[str, str]] = []
 
-    def sync_remote_base(self, remote: str, base_branch: str) -> dict:
+    def sync_remote_base(self, remote: str, base_branch: str, **kwargs) -> dict:
         self.calls.append(("sync", f"{remote}/{base_branch}"))
         if self.blocked:
             return {
@@ -32,15 +33,22 @@ class FakePublishGit:
             "branch_after": base_branch,
         }
 
-    def apply_trial_to_baseline(self, trial_code_dir: Path, trial_id: str) -> dict:
+    def apply_trial_to_baseline(self, trial_code_dir: Path, trial_id: str, **kwargs) -> dict:
         self.calls.append(("apply", trial_id))
         return {"trial_id": trial_id, "trial_code_dir": str(trial_code_dir)}
 
-    def commit_baseline_model_update(self, trial_id: str, metrics: dict, report_path: str, supplement: str | None) -> dict:
+    def commit_baseline_model_update(self, trial_id: str, metrics: dict, report_path: str, supplement: str | None, **kwargs) -> dict:
         self.calls.append(("commit", trial_id))
         return {"committed": True, "trial_id": trial_id, "commit": "commit-sha"}
 
-    def push_model_trial_branch(self, branch: str, remote: str, target_branch: str | None = None) -> dict:
+    def push_model_trial_branch(self, branch: str, remote: str, target_branch: str | None = None, **kwargs) -> dict:
+        if not kwargs.get("human_approved", True):
+            self.calls.append(("push_blocked", target_branch or branch))
+            return {
+                "pushed": False,
+                "blocked": True,
+                "reason": "remote push requires an explicit human KEEP approval",
+            }
         self.calls.append(("push", target_branch or branch))
         return {
             "pushed": True,
@@ -49,11 +57,11 @@ class FakePublishGit:
             "target_branch": target_branch or branch,
         }
 
-    def create_model_pr(self, branch: str, base: str, body: str, title: str, draft: bool) -> dict:
+    def create_model_pr(self, branch: str, base: str, body: str, title: str, draft: bool, **kwargs) -> dict:
         self.calls.append(("pr", branch))
         return {"created": False, "draft_path": "/fake/pr.md", "branch": branch, "base": base}
 
-    def get_model_repo_state(self) -> dict:
+    def get_model_repo_state(self, **kwargs) -> dict:
         self.calls.append(("state", ""))
         return {"branch": "model-exp/run_trial_001", "head": "commit-sha", "model_dirty": False}
 
@@ -87,9 +95,9 @@ class GitPublishFlowTest(unittest.TestCase):
 
         self.assertTrue(agent_loop.should_stop)
         self.assertIn("Git baseline sync failed", agent_loop._stop_reason)
-        self.assertIn(("sync", "forecastops/ForecastModel"), fake_git.calls)
+        self.assertIn(("sync", "origin/develop"), fake_git.calls)
 
-    def test_keep_pushes_and_creates_pr_without_training(self) -> None:
+    def test_keep_without_human_approval_does_not_remote_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             baseline = root / "baseline"
@@ -126,11 +134,60 @@ class GitPublishFlowTest(unittest.TestCase):
                 actions = [name for name, _ in fake_git.calls]
                 self.assertIn("apply", actions)
                 self.assertIn("commit", actions)
-                self.assertIn("push", actions)
+                self.assertIn("push_blocked", actions)
+                self.assertNotIn("push", actions)
                 self.assertNotIn("pr", actions)
-                self.assertIn(("push", "ForecastModel"), fake_git.calls)
+                self.assertIn(("push_blocked", "develop"), fake_git.calls)
                 self.assertEqual(agent_loop.current_previous_trial, str(trial))
                 self.assertTrue((trial / "git_publish_result.json").exists())
+
+    def test_git_mcp_registration_replaces_whole_table_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex_home"
+            codex_home.mkdir()
+            config_path = codex_home / "config.toml"
+            config_path.write_text(
+                """[mcp_servers.git_research]
+command = 'old-python'
+args = ['old']
+
+[mcp_servers.git_research.env]
+PYTHONPATH = 'old-root'
+
+[mcp_servers.git_research.env]
+PYTHONPATH = 'duplicate-root'
+
+[projects.\"/tmp/project\"]
+trust_level = \"trusted\"
+""",
+                encoding="utf-8",
+            )
+            fake_git = SimpleNamespace(
+                server_command="python",
+                server_args=["-m", "mcp_servers.git_research_server.server"],
+            )
+            fake_config = SimpleNamespace(
+                resolved_codex_home=str(codex_home),
+                mcp=SimpleNamespace(git=fake_git),
+            )
+
+            import git_subagent
+
+            with (
+                patch.object(git_subagent, "get_config", return_value=fake_config),
+                patch.object(git_subagent, "PROJECT_ROOT", root / "project"),
+                patch.object(git_subagent.sys, "executable", "/venv/python"),
+            ):
+                git_subagent.ensure_git_mcp_registered()
+                git_subagent.ensure_git_mcp_registered()
+
+            text = config_path.read_text(encoding="utf-8")
+            self.assertEqual(text.count("[mcp_servers.git_research]"), 1)
+            self.assertEqual(text.count("[mcp_servers.git_research.env]"), 1)
+            self.assertIn("command = '/venv/python'", text)
+            self.assertIn("[projects.\"/tmp/project\"]", text)
+            self.assertNotIn("duplicate-root", text)
 
     def test_subagent_prompt_requires_git_mcp_only(self) -> None:
         import git_subagent

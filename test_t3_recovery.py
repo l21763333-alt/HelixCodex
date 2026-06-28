@@ -145,6 +145,72 @@ class T3RecoveryTest(unittest.TestCase):
             self.assertFalse(_needs_codegen_retry(comparison))
             self.assertTrue(json.loads((trial / "agent2" / "run_status.json").read_text())["eval_success"])
 
+    def test_generic_output_contract_computes_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trial = root / "trial_generic"
+            baseline = root / "baseline"
+            trial_id = "trial_generic"
+            _ensure_dirs(str(trial))
+            (baseline / "outputs").mkdir(parents=True, exist_ok=True)
+            (baseline / "outputs" / "baseline_generic.csv").write_text(
+                "split,actual_value,predicted_value\n"
+                "test,10,7\n",
+                encoding="utf-8",
+            )
+            _write_standardized_actual(trial)
+            (trial / "agent2").mkdir(parents=True, exist_ok=True)
+            (trial / "agent2" / "agent2_execution_plan.yaml").write_text(
+                textwrap.dedent(
+                    f"""
+                    agent: Agent2
+                    trial_id: {trial_id}
+                    train_command:
+                      - "python"
+                      - "candidate/code/train.py"
+                      - "--output_dir"
+                      - "{{trial_outputs_dir}}"
+                    output_contract:
+                      prediction_path: "generic_prediction.csv"
+                      split_column: "split"
+                      split_filter: "test"
+                      actual_column: "actual_value"
+                      prediction_column: "predicted_value"
+                      baseline_prediction_globs: ["baseline_generic.csv"]
+                      secondary_metric_globs: []
+                      primary_level: "generic"
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            _write_train_py(
+                trial,
+                textwrap.dedent(
+                    """
+                    import argparse
+                    from pathlib import Path
+                    parser = argparse.ArgumentParser()
+                    parser.add_argument("--output_dir", required=True)
+                    args, _ = parser.parse_known_args()
+                    out = Path(args.output_dir)
+                    out.mkdir(parents=True, exist_ok=True)
+                    (out / "generic_prediction.csv").write_text(
+                        "split,actual_value,predicted_value\\n"
+                        "test,10,8\\n",
+                        encoding="utf-8",
+                    )
+                    """
+                ),
+            )
+
+            comparison = _execute_t3_quietly(_manifest(trial, baseline, trial_id), baseline / "outputs")
+
+            self.assertEqual(comparison["primary"]["level"], "generic")
+            self.assertEqual(comparison["primary"]["new_wape"], 0.2)
+            self.assertEqual(comparison["primary"]["old_wape"], 0.3)
+            self.assertFalse(_needs_codegen_retry(comparison))
+
     def test_invalid_raw_feature_output_returns_retryable_metrics_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -19,7 +19,9 @@ Codex Flow 是一个面向预测模型迭代的自动化实验系统。它把 Co
 | `runs/` | 每次运行和每轮 trial 的实验产物、日志、报告、checkpoint |
 | `mcp_servers/git_research_server/` | 真 MCP Git server，封装受限 Git 操作工具 |
 | `git_subagent.py` | Git subagent 入口，通过 Codex thread + Git MCP 执行同步、提交、推送 |
-| `lark_notify.py` / `lark_card_bot.py` | 飞书通知、审核卡片、恢复卡片和按钮/命令回调 |
+| `lark_notify.py` | 飞书通知、审核卡片和恢复卡片发送 |
+| `lark_channel_bot.py` | 飞书 SDK 长连接接收服务，接收文本命令和卡片按钮事件，无需公网回调 |
+| `lark_card_bot.py` / `card_server.py` | 飞书 HTTP 卡片回调兼容入口，需要公网或网关地址 |
 
 ## 阶段流程
 
@@ -155,6 +157,15 @@ loop 启动时可以同步远端 `forecastops/ForecastModel` 作为当日初始 
 1. 实验审核：KEEP、ROLLBACK、REVERSE、STOP。
 2. 阶段恢复：RESUME、RETRY-STAGE、SKIP-STAGE、STOP。
 
+当前推荐入口是 `lark_channel_bot.py`，它使用 `lark-oapi` SDK WebSocket 长连接接收文本消息和 `cardAction` 事件，不需要公网回调地址或内网穿透。`lark_card_bot.py` / `card_server.py` 仍保留为 HTTP 回调兼容入口，只有使用该入口时才需要配置飞书卡片回调 URL。
+
+长连接服务启动方式：
+
+```bash
+source venv/bin/activate
+python lark_channel_bot.py
+```
+
 按钮回调和文本命令都会记录到：
 
 ```text
@@ -170,13 +181,13 @@ runs/git_action_log.jsonl
 ## 推荐目录结构
 
 ```text
+/data/dataworks_data/
+  dwd_forecast_package_feature_df.csv
+
 Codex_flow/
   baseline/
     src/
     requirements.txt
-    data/
-      dish_package_feature_df.csv
-      holiday_imformation.csv
 
   runs/
     020/

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import sys
+
 from openai_codex import Codex
+
 from config import build_codex_config, get_config
+
 
 cfg = get_config()
 prompt = " ".join(sys.argv[1:]) or "Say OK"

@@ -6,3 +6,4 @@ pydantic==2.13.4
 pydantic_core==2.46.4
 PyYAML==6.0.3
 mcp
+lark-oapi==1.6.9

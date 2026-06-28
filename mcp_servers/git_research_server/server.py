@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from .baseline_git_server import (
     apply_trial_to_baseline,
+    apply_trial_to_model,
     commit_baseline_model_update,
+    commit_model_update,
     create_model_pr,
     create_model_trial_branch,
     diff_trial_model_code,
@@ -11,7 +13,9 @@ from .baseline_git_server import (
     publish_keep_result,
     push_model_trial_branch,
     restore_baseline_model_snapshot,
+    restore_model_snapshot,
     snapshot_baseline_model,
+    snapshot_model,
     sync_remote_base,
 )
 
@@ -29,23 +33,27 @@ def build_mcp_server():
     mcp = FastMCP(
         "git_research",
         instructions=(
-            "Safe Git tools for Codex Flow. Only baseline/src/** and "
-            "baseline/requirements.txt may be staged or restored. "
+            "Safe Git tools for Codex Flow. Operations are scoped by repo_id "
+            "and only the configured allowed_paths may be staged or restored. "
             "Use these tools instead of shell git commands."
         ),
     )
     mcp.tool()(sync_remote_base)
     mcp.tool()(get_model_repo_state)
     mcp.tool()(snapshot_baseline_model)
+    mcp.tool()(snapshot_model)
     mcp.tool()(create_model_trial_branch)
     mcp.tool()(diff_trial_model_code)
     mcp.tool()(apply_trial_to_baseline)
+    mcp.tool()(apply_trial_to_model)
     mcp.tool()(commit_baseline_model_update)
+    mcp.tool()(commit_model_update)
     mcp.tool()(push_model_trial_branch)
     mcp.tool()(create_model_pr)
     mcp.tool()(publish_keep_result)
     mcp.tool()(discard_unaccepted_model_changes)
     mcp.tool()(restore_baseline_model_snapshot)
+    mcp.tool()(restore_model_snapshot)
     return mcp
 
 
@@ -55,8 +63,10 @@ def main() -> None:
 
 __all__ = [
     "apply_trial_to_baseline",
+    "apply_trial_to_model",
     "build_mcp_server",
     "commit_baseline_model_update",
+    "commit_model_update",
     "create_model_pr",
     "create_model_trial_branch",
     "diff_trial_model_code",
@@ -66,7 +76,9 @@ __all__ = [
     "publish_keep_result",
     "push_model_trial_branch",
     "restore_baseline_model_snapshot",
+    "restore_model_snapshot",
     "snapshot_baseline_model",
+    "snapshot_model",
     "sync_remote_base",
 ]
 

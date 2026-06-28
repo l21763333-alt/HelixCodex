@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lark_notify.py — 飞书通知 + 人审交互 (直接 HTTP API, 零外部依赖)
+lark_notify.py — 飞书通知 + 人审交互 (官方 SDK 优先, HTTP API 兜底)
 
   发送:  send_text / send_markdown / notify_*
   接收:  wait_for_new_message / feishu_review
@@ -20,6 +20,14 @@ import urllib.error
 from pathlib import Path
 from typing import Any
 
+try:
+    import lark_oapi as lark
+    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+except ImportError:  # SDK is optional at runtime; urllib fallback remains available.
+    lark = None
+    CreateMessageRequest = None
+    CreateMessageRequestBody = None
+
 from config import get_config, get_paths
 
 # ── API 端点 ────────────────────────────────────────────
@@ -31,8 +39,9 @@ FS_MSG_LIST    = f"{FS_BASE}/im/v1/messages"
 PROJECT_ROOT = Path(__file__).resolve().parent
 CARD_ACTION_LOG = get_paths().global_artifact("feishu_action_log")
 
-# ── Token 缓存 ──────────────────────────────────────────
+# ── Token / SDK 缓存 ─────────────────────────────────────
 _token_cache: dict = {"token": "", "expires_at": 0.0}
+_sdk_client_cache: dict[str, Any] = {"key": None, "client": None}
 
 
 def normalize_supplement(value: Any) -> str | None:
@@ -99,17 +108,72 @@ def _chat_id() -> str:
     return get_config().feishu.chat_id
 
 
-def _send(msg_type: str, content: str, cid: str | None = None) -> bool:
-    cid = cid or _chat_id()
-    if not cid:
+def _receive_id_type(cid: str) -> str:
+    return "chat_id" if cid.startswith("oc_") else "user_id"
+
+
+def _get_sdk_client() -> Any | None:
+    if lark is None:
+        return None
+    cfg = get_config().feishu
+    if not cfg.app_id or not cfg.app_secret:
+        return None
+    key = (cfg.app_id, cfg.app_secret)
+    if _sdk_client_cache.get("key") == key and _sdk_client_cache.get("client") is not None:
+        return _sdk_client_cache["client"]
+    client = lark.Client.builder().app_id(cfg.app_id).app_secret(cfg.app_secret).build()
+    _sdk_client_cache["key"] = key
+    _sdk_client_cache["client"] = client
+    return client
+
+
+def _send_via_sdk(msg_type: str, content: str, cid: str) -> bool | None:
+    if CreateMessageRequest is None or CreateMessageRequestBody is None:
+        return None
+    client = _get_sdk_client()
+    if client is None:
+        return None
+
+    request = CreateMessageRequest.builder() \
+        .receive_id_type(_receive_id_type(cid)) \
+        .request_body(CreateMessageRequestBody.builder()
+            .receive_id(cid)
+            .msg_type(msg_type)
+            .content(content)
+            .build()) \
+        .build()
+
+    try:
+        response = client.im.v1.message.create(request)
+    except Exception as exc:
+        print(f"[Lark SDK] 发送异常: {exc}")
         return False
+
+    if not response.success():
+        print(f"[Lark SDK] 发送失败: code={response.code} msg={response.msg}")
+        return False
+    return True
+
+
+def _send_via_http(msg_type: str, content: str, cid: str) -> bool:
     body = {"receive_id": cid, "msg_type": msg_type, "content": content}
-    rid_type = "chat_id" if cid.startswith("oc_") else "user_id"
-    r = _feishu_request("POST", f"{FS_SEND_URL}?receive_id_type={rid_type}", body)
+    r = _feishu_request("POST", f"{FS_SEND_URL}?receive_id_type={_receive_id_type(cid)}", body)
     if r.get("code") != 0:
         print(f"[Lark] 发送失败: {r.get('msg', '')}")
         return False
     return True
+
+
+def _send(msg_type: str, content: str, cid: str | None = None) -> bool:
+    cid = cid or _chat_id()
+    if not cid:
+        return False
+
+    sdk_result = _send_via_sdk(msg_type, content, cid)
+    if sdk_result is not None:
+        return sdk_result
+
+    return _send_via_http(msg_type, content, cid)
 
 
 def send_text(text: str, chat_id: str | None = None) -> bool:

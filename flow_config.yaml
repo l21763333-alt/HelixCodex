@@ -13,6 +13,21 @@ auth:
   openai_api_key: ""
   codex_api_key: ""
 
+codex_gateway:
+  # Use the existing HTTP_PROXY/HTTPS_PROXY by default on this server.
+  # Switch mode to cloudflared_access_tcp only after filling a real Access hostname.
+  enabled: true
+  mode: "proxy_env_only"
+  cloudflared_path: ".tools/cloudflared"
+  hostname: ""
+  listener: "127.0.0.1:18080"
+  proxy_url: ""
+  log_file: ".codex_home/cloudflared-codex.log"
+  pid_file: ".codex_home/cloudflared-codex.pid"
+  log_level: "info"
+  service_token_id: ""
+  service_token_secret: ""
+
 feishu:
   enabled: true
   # Credentials and identifiers are read only from environment variables:
@@ -67,22 +82,121 @@ mcp:
   git:
     enabled: true
     scope: "baseline_model"
-    repo_path: "."
-    baseline_dir: "baseline"
+    active_repo: "supply_chain_package_forecast"
+    repositories:
+      supply_chain_package_forecast:
+        repo:
+          # Resolved relative to forecastops-agent/ -> /data/xujuanyi/CodexFlow/SupplyChain_worktree
+          path: "../SupplyChain_worktree"
+          url: "ssh://git@172.18.254.56:221/haidilao-algo/forecasting/supply_chain.git"
+          lifecycle: "clone_if_missing"
+          remote: "origin"
+          base_branch: "develop"
+          sync_strategy: "ff_only"
+        model:
+          root: "src/supply_chain/forecast/package_forecast"
+          copy_include:
+            - "**"
+          copy_exclude:
+            - "__pycache__/**"
+            - "*.pyc"
+            - ".git/**"
+            - "data/**"
+            - "outputs/**"
+            - "logs/**"
+          publish_paths:
+            - "src/supply_chain/forecast/package_forecast/**"
+          requirements_paths:
+            - "requirements.txt"
+          entrypoint_candidates:
+            - "train.py"
+            - "main.py"
+            - "run.py"
+            - "scripts/train.py"
+          default_train_command: []
+          output_contract:
+            prediction_path: "{trial_id}_package_detail.csv"
+            split_column: "split"
+            split_filter: "test"
+            actual_candidates: ["true_pos_cnt", "true_real_qty_sum", "actual", "y_true"]
+            prediction_candidates: ["pred_pos_cnt", "pred_real_qty_sum", "prediction", "y_pred"]
+            baseline_prediction_globs: ["*_package_detail.csv", "*.csv"]
+            secondary_metric_globs: ["*_store_dish_day.csv"]
+            primary_level: "package_detail"
+            secondary_level: "store_dish_day"
+        publish:
+          mode: "direct_branch"
+          branch_prefix: "model-exp/"
+          target_branch: "develop"
+          push_on_keep: true
+          create_pr: false
+          pr_draft: true
+
+    # Defaults kept consistent for legacy callers and fallback resolution.
+    repo:
+      path: "../SupplyChain_worktree"
+      url: "ssh://git@172.18.254.56:221/haidilao-algo/forecasting/supply_chain.git"
+      lifecycle: "clone_if_missing"
+      remote: "origin"
+      base_branch: "develop"
+      sync_strategy: "ff_only"
+    model:
+      root: "src/supply_chain/forecast/package_forecast"
+      copy_include:
+        - "**"
+      copy_exclude:
+        - "__pycache__/**"
+        - "*.pyc"
+        - ".git/**"
+        - "data/**"
+        - "outputs/**"
+        - "logs/**"
+      publish_paths:
+        - "src/supply_chain/forecast/package_forecast/**"
+      requirements_paths:
+        - "requirements.txt"
+      entrypoint_candidates:
+        - "train.py"
+        - "main.py"
+        - "run.py"
+        - "scripts/train.py"
+      default_train_command: []
+      output_contract:
+        prediction_path: "{trial_id}_package_detail.csv"
+        split_column: "split"
+        split_filter: "test"
+        actual_candidates: ["true_pos_cnt", "true_real_qty_sum", "actual", "y_true"]
+        prediction_candidates: ["pred_pos_cnt", "pred_real_qty_sum", "prediction", "y_pred"]
+        baseline_prediction_globs: ["*_package_detail.csv", "*.csv"]
+        secondary_metric_globs: ["*_store_dish_day.csv"]
+        primary_level: "package_detail"
+        secondary_level: "store_dish_day"
+    publish:
+      mode: "direct_branch"
+      branch_prefix: "model-exp/"
+      target_branch: "develop"
+      push_on_keep: true
+      create_pr: false
+      pr_draft: true
+
+    repo_path: "../SupplyChain_worktree"
+    baseline_dir: "src/supply_chain/forecast/package_forecast"
+    source_dir: "src/supply_chain/forecast/package_forecast"
+    requirements: "src/supply_chain/forecast/package_forecast/requirements.txt"
     allowed_paths:
-      - "baseline/src/**"
-      - "baseline/requirements.txt"
+      - "src/supply_chain/forecast/package_forecast/**"
     trial_code_subdir: "candidate/code"
     branch_prefix: "model-exp/"
-    remote: "forecastops"
-    base_branch: "ForecastModel"
+    remote: "origin"
+    base_branch: "develop"
     sync_on_loop_start: true
     sync_before_each_trial: false
-    publish_via_subagent: true
+    # Use direct deterministic Git MCP for sync/publish orchestration; the main optimization still uses Codex threads.
+    publish_via_subagent: false
     push_on_keep: true
     create_pr_on_keep: false
     pr_draft: true
-    push_target_branch: "ForecastModel"
+    push_target_branch: "develop"
     server_transport: "stdio"
     server_command: "python"
     server_args:
